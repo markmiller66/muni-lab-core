@@ -1,0 +1,11 @@
+# Example configuration for muni-lab-core
+
+curves:
+  # Paths are interpreted as relative to the repo root unless absolute.
+  wide_curve_file: "data/AAA_MUNI_CURVE/aaa_curves.xlsx"
+  wide_curve_sheet: "Curves_Wide"
+
+  spot_curve_file: "data/AAA_MUNI_CURVE/aaa_curves.xlsx"
+  spot_curve_sheet: "AAA_Spot"
+
+  curve_strategy: "excel_curves_wide"

@@ -1,0 +1,11 @@
+pandas
+numpy
+openpyxl
+QuantLib
+scipy
+pyyaml
+numpy
+quantlib
+matplotlib
+pyyaml
+pytest
