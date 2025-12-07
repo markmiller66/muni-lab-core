@@ -15,6 +15,9 @@ from .forward_helpers import (
     forward_rate_between_dates,
     forward_rate_to_date,
     forward_curve_grid,
+    forward_at_call,
+    forward_after_call,
+    forward_slope_around_call_bp,
 )
 
 __all__ = [
@@ -29,4 +32,7 @@ __all__ = [
     "forward_rate_between_dates",
     "forward_rate_to_date",
     "forward_curve_grid",
+    "forward_at_call",
+    "forward_after_call",
+    "forward_slope_around_call_bp",
 ]
