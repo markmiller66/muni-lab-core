@@ -205,3 +205,31 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDEs
+.idea/
+.vscode/
+
+# Data / temp outputs
+data/**/*.tmp
+output/
+*.ipynb_checkpoints/
+
+# Optional: large local-only files
+*.xlsb
