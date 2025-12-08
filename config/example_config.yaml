@@ -9,3 +9,12 @@ curves:
   spot_curve_sheet: "AAA_Spot"
 
   curve_strategy: "excel_curves_wide"
+
+master_bucket:
+  # Path to your MUNI_MASTER_BUCKET workbook, relative to repo root.
+  file: "config/MUNI_MASTER_BUCKET.xlsx"
+
+  # Sheet names inside that workbook:
+  column_map_sheet: "ColumnMap"
+  controls_sheet: "Controls"
+  rating_map_sheet: "RatingMap"

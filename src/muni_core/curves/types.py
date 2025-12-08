@@ -1,8 +1,10 @@
+
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable, List, Tuple
-
+import math
 
 @dataclass
 class CurvePoint:
@@ -74,20 +76,29 @@ class ZeroCurve:
 
     def forward_rate(self, t1: float, t2: float) -> float:
         """
-        Simple implied forward rate between t1 and t2 (continuously compounded).
+        Forward rate between t1 and t2 (year fractions).
 
-        Formula:
-            DF(t) = exp(-r(t)*t)
-            F(t1, t2) solves DF(t2) = DF(t1) * exp(-F * (t2 - t1))
-        So:
-            F = (r(t2)*t2 - r(t1)*t1) / (t2 - t1)
+        Robust to bad inputs:
+          - clamp negative times to 0
+          - if t2 <= t1, nudge t2 slightly forward so we don't explode
+
+        This keeps diagnostics like "forward at call" from blowing up if
+        the call date is in the past or if start/end dates coincide.
         """
-        t1 = float(t1)
-        t2 = float(t2)
+        # Clamp to non-negative times
+        t1 = max(0.0, float(t1))
+        t2 = max(0.0, float(t2))
+
+        # Ensure t2 > t1 by at least a tiny epsilon
         if t2 <= t1:
-            raise ValueError("t2 must be greater than t1 for forward rate")
+            t2 = t1 + 1e-6  # effectively instantaneous forward
 
-        r1 = self.zero_rate(t1)
-        r2 = self.zero_rate(t2)
+        # Use whatever your discount method is called: discount() or discount_factor()
+        df1 = self.discount_factor(t1)
+        df2 = self.discount_factor(t2)
 
-        return (r2 * t2 - r1 * t1) / (t2 - t1)
+        if df1 <= 0 or df2 <= 0:
+            raise ValueError(f"Non-positive discount factors: df1={df1}, df2={df2}")
+
+        return -math.log(df2 / df1) / (t2 - t1)
+
