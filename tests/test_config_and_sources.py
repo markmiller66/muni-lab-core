@@ -88,6 +88,37 @@ def main() -> None:
         print(f"  VIX index range: {vix_df.index.min()} -> {vix_df.index.max()}")
         print(f"  VIX columns: {list(vix_df.columns)[:8]} ...")
 
+    from muni_core.curves.history import (
+        build_historical_curves,
+        get_zero_curve_for_date,
+    )
+
+    # ... after your existing prints/tests ...
+
+    print("\n[TEST] Building historical curves table (par version)...")
+    history_df = build_historical_curves(
+        treas_df=treas_df,
+        muni_df=muni_df,
+        vix_df=vix_df,
+        app_cfg=app_cfg,
+    )
+    print(f"  History rows: {len(history_df)}")
+    print(f"  History date range: {history_df['date'].min()} -> {history_df['date'].max()}")
+    print(f"  History curve_keys: {history_df['curve_key'].unique()}")
+
+    # Try to build a ZeroCurve for the configured as-of date
+    from datetime import datetime
+
+    if app_cfg.curves.curve_asof_date:
+        asof = datetime.fromisoformat(app_cfg.curves.curve_asof_date).date()
+        print(f"\n[TEST] Building ZeroCurve for {asof} / AAA_MUNI_PAR ...")
+        zc = get_zero_curve_for_date(asof, "AAA_MUNI_PAR", app_cfg)
+        print(f"  ZeroCurve has {len(zc.points)} points.")
+    else:
+        print("\n[WARN] curves.curve_asof_date is not set; skipping ZeroCurve test.")
+
+    print("\n[OK] Config, raw data loading, and history/ZeroCurve wiring appear to work.")
+
     print("\n[OK] Config + raw data loading appear to work.")
 
 
