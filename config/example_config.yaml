@@ -10,11 +10,24 @@ curves:
 
   curve_strategy: "excel_curves_wide"
 
-master_bucket:
-  # Path to your MUNI_MASTER_BUCKET workbook, relative to repo root.
-  file: "config/MUNI_MASTER_BUCKET.xlsx"
+  # NEW: historical curve cache produced by your spot/history builder
+  # (you can use .parquet, .csv, or .xlsx; I’d lean parquet)
+  history_file: "data/AAA_MUNI_CURVE/aaa_muni_treas_history.parquet"
 
-  # Sheet names inside that workbook:
+  # NEW: default curve date for OAS / call models
+  # (single place to set “use this curve date”)
+  curve_asof_date: "2025-11-26"
+
+master_bucket:
+  file: "config/MUNI_MASTER_BUCKET.xlsx"
   column_map_sheet: "ColumnMap"
   controls_sheet: "Controls"
   rating_map_sheet: "RatingMap"
+
+# NEW: raw sources for the curve builder (what your old spot.py was hard-coding)
+curve_sources:
+  data_root: "data"
+  treasury_file: "feds200628.csv"
+  muni_file: "Tradeweb_MUNI_data (4).csv"
+  vix_file: "muni_vix_data (2).csv"   # optional; can be null/omitted
+  treasury_skiprows: 9

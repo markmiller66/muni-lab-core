@@ -8,6 +8,8 @@ import yaml
 import pandas as pd
 
 
+# ---------- Curves & Sources ----------
+
 @dataclass
 class CurvesConfig:
     wide_curve_file: Path
@@ -16,6 +18,28 @@ class CurvesConfig:
     spot_curve_sheet: str
     curve_strategy: str
 
+    # NEW: optional historical spot cache + as-of date
+    # e.g. history_file = data/AAA_MUNI_CURVE/aaa_muni_treas_history.parquet
+    # curve_asof_date = "2025-11-26"
+    history_file: Optional[Path] = None
+    curve_asof_date: Optional[str] = None  # keep as string; parse later where needed
+
+
+@dataclass
+class CurveSourcesConfig:
+    """
+    Raw data sources for building spot curves from Tradeweb / Fed / VIX.
+    These are what your (former) spot.py will read.
+    """
+    data_root: Path              # e.g. "data"
+    treasury_file: str           # e.g. "feds200628.csv"
+    muni_file: str               # e.g. "Tradeweb_MUNI_data (4).csv"
+    vix_file: Optional[str] = None  # e.g. "muni_vix_data (2).csv"
+
+    treasury_skiprows: int = 9   # Fed CSV header rows, as in your script
+
+
+# ---------- Master Bucket ----------
 
 @dataclass
 class MasterBucketConfig:
@@ -37,11 +61,13 @@ class AppConfig:
     """
     Top-level configuration object for muni_core.
 
-    - curves: where to find the AAA curves
+    - curves: where to find the AAA curves and historical spot cache
     - master_bucket: where to find the MUNI_MASTER_BUCKET workbook
+    - curve_sources: raw inputs (Tradeweb, Fed, VIX) for building spot/history
     """
     curves: CurvesConfig
     master_bucket: Optional[MasterBucketConfig] = None
+    curve_sources: Optional[CurveSourcesConfig] = None   # NEW
 
     @classmethod
     def from_yaml(cls, cfg_path: Path) -> "AppConfig":
@@ -64,7 +90,7 @@ class AppConfig:
             return path.resolve()
 
         # ----- Curves -----
-        curves_data: Dict[str, Any] = data.get("curves", {})
+        curves_data: Dict[str, Any] = data.get("curves", {}) or {}
 
         wide_curve_file = resolve_path(
             curves_data.get("wide_curve_file", "data/AAA_MUNI_CURVE/aaa_curves.xlsx")
@@ -73,12 +99,21 @@ class AppConfig:
             curves_data.get("spot_curve_file", "data/AAA_MUNI_CURVE/aaa_curves.xlsx")
         )
 
+        history_file_raw = curves_data.get("history_file")
+        history_file: Optional[Path]
+        if history_file_raw:
+            history_file = resolve_path(history_file_raw)
+        else:
+            history_file = None
+
         curves_cfg = CurvesConfig(
             wide_curve_file=wide_curve_file,
             wide_curve_sheet=curves_data.get("wide_curve_sheet", "Curves_Wide"),
             spot_curve_file=spot_curve_file,
             spot_curve_sheet=curves_data.get("spot_curve_sheet", "AAA_Spot"),
             curve_strategy=curves_data.get("curve_strategy", "excel_curves_wide"),
+            history_file=history_file,
+            curve_asof_date=curves_data.get("curve_asof_date"),  # may be None
         )
 
         # ----- Master Bucket -----
@@ -93,7 +128,26 @@ class AppConfig:
                 rating_map_sheet=mb_data.get("rating_map_sheet", "RatingMap"),
             )
 
-        return cls(curves=curves_cfg, master_bucket=mb_cfg)
+        # ----- Curve Sources (Tradeweb / Fed / VIX) -----
+        cs_cfg: Optional[CurveSourcesConfig] = None
+        cs_data: Dict[str, Any] = data.get("curve_sources", {}) or {}
+
+        if cs_data:
+            data_root = resolve_path(cs_data.get("data_root", "data"))
+            treasury_file = cs_data.get("treasury_file", "feds200628.csv")
+            muni_file = cs_data.get("muni_file", "Tradeweb_MUNI_data (4).csv")
+            vix_file = cs_data.get("vix_file")  # may be None
+            treasury_skiprows = int(cs_data.get("treasury_skiprows", 9))
+
+            cs_cfg = CurveSourcesConfig(
+                data_root=data_root,
+                treasury_file=treasury_file,
+                muni_file=muni_file,
+                vix_file=vix_file,
+                treasury_skiprows=treasury_skiprows,
+            )
+
+        return cls(curves=curves_cfg, master_bucket=mb_cfg, curve_sources=cs_cfg)
 
     # -------------- ColumnMap helpers --------------
 
@@ -101,16 +155,6 @@ class AppConfig:
         """
         Load the ColumnMap sheet from the MUNI_MASTER_BUCKET workbook and
         return a mapping: {logical_name: excel_column_name}.
-
-        Expected sheet structure (flexible on header names):
-
-            LogicalName | ExcelColumn
-            ------------+------------
-            cusip_col   | CUSIP
-            maturity_date_col | MATURITY
-            ...
-
-        Header variations like "Logical Name" / "Excel Column" are also accepted.
         """
         if self.master_bucket is None:
             raise ValueError("master_bucket configuration not set in YAML.")
