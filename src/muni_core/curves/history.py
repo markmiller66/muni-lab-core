@@ -15,7 +15,8 @@ from .zero_curve import make_zero_curve_from_pairs
 
 
 # You can adjust/extend these later as needed
-CurveKey = Literal["AAA_MUNI_PAR", "UST_PAR"]
+CurCurveKey = Literal["AAA_MUNI_PAR", "AAA_MUNI_SPOT", "UST_PAR", "UST_SPOT"]
+
 
 
 @dataclass
@@ -30,6 +31,87 @@ class CurveHistoryConfig:
         if app_cfg.curves.history_file is None:
             raise ValueError("curves.history_file is not set in AppConfig/YAML.")
         return cls(history_file=app_cfg.curves.history_file)
+
+def bootstrap_spot_from_par(
+    par_df: pd.DataFrame,
+    curve_key_in: str,
+    curve_key_out: str,
+) -> pd.DataFrame:
+    """
+    Very simple par -> spot bootstrap assuming ANNUAL coupons and
+    integer-year tenors.
+
+    par_df must have columns: date, curve_key, tenor_yrs, rate_dec (par yield in DECIMAL).
+
+    For each (date, curve_key_in), we:
+      - sort by tenor_yrs
+      - bootstrap discount factors DF_t using par pricing at par=1
+      - convert DF_t to spot zero rate via: DF_t = (1 + z_t)^(-t)
+    Returns a long DataFrame with columns: date, curve_key, tenor_yrs, rate_dec,
+    where rate_dec is the SPOT zero yield (decimal).
+    """
+    records: list[dict] = []
+
+    # Filter to the specific curve_key_in
+    df = par_df[par_df["curve_key"] == curve_key_in].copy()
+
+    for dt, group in df.groupby("date"):
+        group = group.sort_values("tenor_yrs")
+
+        # Discount factors indexed by integer year t
+        dfs: dict[int, float] = {}
+
+        for _, row in group.iterrows():
+            tenor = float(row["tenor_yrs"])
+            y = float(row["rate_dec"])  # par yield in decimal
+
+            # assume integer-year tenor
+            t = int(round(tenor))
+            if t <= 0:
+                continue
+
+            if t == 1:
+                # 1 = (1 + y) * DF_1
+                DF_t = 1.0 / (1.0 + y)
+            else:
+                # Annual coupons:
+                # 1 = y * sum_{i=1}^{t-1} DF_i + (1 + y) * DF_t
+                coupon_sum = 0.0
+                for i in range(1, t):
+                    if i not in dfs:
+                        # if missing, we bail out for this term
+                        coupon_sum = None
+                        break
+                    coupon_sum += dfs[i]
+
+                if coupon_sum is None:
+                    continue
+
+                DF_t = (1.0 - y * coupon_sum) / (1.0 + y)
+
+            if DF_t <= 0.0:
+                # ignore pathological cases
+                continue
+
+            dfs[t] = DF_t
+
+            # Convert DF_t to annual spot z_t: DF_t = (1 + z_t)^(-t)
+            spot = DF_t ** (-1.0 / t) - 1.0
+
+            records.append(
+                {
+                    "date": dt,
+                    "curve_key": curve_key_out,
+                    "tenor_yrs": float(t),
+                    "rate_dec": spot,
+                }
+            )
+
+    out = pd.DataFrame.from_records(records)
+    if not out.empty:
+        out.sort_values(["date", "tenor_yrs"], inplace=True)
+        out.reset_index(drop=True, inplace=True)
+    return out
 
 
 def build_historical_curves(
@@ -91,6 +173,12 @@ def build_historical_curves(
             )
 
     muni_long = pd.DataFrame.from_records(muni_long_records)
+    # --- Muni SPOT (bootstrapped from AAA_MUNI_PAR) ---
+    muni_spot_long = bootstrap_spot_from_par(
+        muni_long,
+        curve_key_in="AAA_MUNI_PAR",
+        curve_key_out="AAA_MUNI_SPOT",
+    )
 
     # --- Treasury side ---
     # For now, grab some standard Svensson/spot columns if they exist.
@@ -115,11 +203,12 @@ def build_historical_curves(
             val = row.get(col)
             if pd.isna(val):
                 continue
-            rate_dec = float(val) / 100.0
+            rate_dec = float(val) / 100.0  # SVENYxx are zero yields in percent
+
             treas_long_records.append(
                 {
                     "date": dt.normalize(),
-                    "curve_key": "UST_PAR",
+                    "curve_key": "UST_SPOT",
                     "tenor_yrs": tenor_yrs,
                     "rate_dec": rate_dec,
                 }
@@ -128,7 +217,10 @@ def build_historical_curves(
     treas_long = pd.DataFrame.from_records(treas_long_records)
 
     # --- Combine ---
-    all_long = pd.concat([muni_long, treas_long], ignore_index=True)
+    # Combine: muni PAR, muni SPOT, UST SPOT
+    frames = [muni_long, muni_spot_long, treas_long]
+    all_long = pd.concat(frames, ignore_index=True)
+
 
     # Optional: sort for sanity
     all_long.sort_values(["date", "curve_key", "tenor_yrs"], inplace=True)

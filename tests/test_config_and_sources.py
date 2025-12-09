@@ -111,9 +111,10 @@ def main() -> None:
 
     if app_cfg.curves.curve_asof_date:
         asof = datetime.fromisoformat(app_cfg.curves.curve_asof_date).date()
-        print(f"\n[TEST] Building ZeroCurve for {asof} / AAA_MUNI_PAR ...")
-        zc = get_zero_curve_for_date(asof, "AAA_MUNI_PAR", app_cfg)
+        print(f"\n[TEST] Building ZeroCurve for {asof} / AAA_MUNI_SPOT ...")
+        zc = get_zero_curve_for_date(asof, "AAA_MUNI_SPOT", app_cfg)
         print(f"  ZeroCurve has {len(zc.points)} points.")
+
     else:
         print("\n[WARN] curves.curve_asof_date is not set; skipping ZeroCurve test.")
 
