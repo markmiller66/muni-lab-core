@@ -20,6 +20,15 @@ from .forward_helpers import (
     forward_slope_around_call_bp,
 )
 
+# NEW: short-rate / Hull–White helper imports
+from .short_rate import (
+    SanitizedCurve,
+    make_time_grid,
+    discount_factor_grid,
+    forward_rate_grid,
+    HullWhite1FParams,
+)
+
 __all__ = [
     "CurvePoint",
     "ZeroCurve",
@@ -35,4 +44,10 @@ __all__ = [
     "forward_at_call",
     "forward_after_call",
     "forward_slope_around_call_bp",
+    # NEW exports
+    "SanitizedCurve",
+    "make_time_grid",
+    "discount_factor_grid",
+    "forward_rate_grid",
+    "HullWhite1FParams",
 ]
