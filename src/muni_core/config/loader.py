@@ -61,13 +61,87 @@ class AppConfig:
     """
     Top-level configuration object for muni_core.
 
-    - curves: where to find the AAA curves and historical spot cache
-    - master_bucket: where to find the MUNI_MASTER_BUCKET workbook
-    - curve_sources: raw inputs (Tradeweb, Fed, VIX) for building spot/history
+    - curves: where to find the AAA curves & history parquet
+    - master_bucket: where to find MUNI_MASTER_BUCKET.xlsx
+    - curve_sources: raw Tradeweb/Fed/VIX CSV sources
     """
     curves: CurvesConfig
     master_bucket: Optional[MasterBucketConfig] = None
-    curve_sources: Optional[CurveSourcesConfig] = None   # NEW
+    curve_sources: Optional[CurveSourcesConfig] = None
+
+    # ---------- path helpers ----------
+
+    @property
+    def repo_root(self) -> Path:
+        """
+        Best-effort guess at the repo root.
+
+        We assume curves.wide_curve_file looks like:
+            <repo_root>/data/AAA_MUNI_CURVE/aaa_curves.xlsx
+        so repo_root is three levels up from that file.
+        """
+        return self.curves.wide_curve_file.parent.parent.parent
+
+    @property
+    def output_root(self) -> Path:
+        """
+        Base output directory for everything:
+
+            <repo_root>/output
+        """
+        out = self.repo_root / "output"
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    @property
+    def dated_output_root(self) -> Path:
+        """
+        Base folder for this run’s curve-related outputs, partitioned by date:
+
+            <repo_root>/output/curves/YYYY-MM-DD
+
+        Date resolution precedence:
+          1) Controls:    CURVE_ASOF_DATE  (if present)
+          2) YAML:        curves.curve_asof_date
+          3) Fallback:    today()
+        Any time component (e.g. '2025-11-28 00:00:00') is stripped off.
+        """
+        from datetime import date
+        import pandas as pd
+
+        asof_raw: Optional[str] = None
+
+        # 1) try Controls (if helper exists)
+        try:
+            if hasattr(self, "get_control_value"):
+                val = self.get_control_value("CURVE_ASOF_DATE", default=None)
+                if val:
+                    asof_raw = str(val)
+        except Exception:
+            asof_raw = None
+
+        # 2) YAML curves.curve_asof_date
+        if not asof_raw and self.curves.curve_asof_date:
+            asof_raw = str(self.curves.curve_asof_date)
+
+        # 3) fallback: today
+        if not asof_raw:
+            asof_dt = date.today()
+        else:
+            # Normalize to date-only, in case we get 'YYYY-MM-DD 00:00:00'
+            asof_dt = pd.to_datetime(asof_raw).date()
+
+        asof_str = asof_dt.isoformat()  # always 'YYYY-MM-DD'
+
+        out = self.output_root / "curves" / asof_str
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    # ---------- YAML loader and helpers follow here ----------
+    # (keep your existing from_yaml, load_column_map, get_control_value, etc.)
+
+
+    # ---------- constructors ----------
 
     @classmethod
     def from_yaml(cls, cfg_path: Path) -> "AppConfig":
@@ -187,3 +261,60 @@ class AppConfig:
                 mapping[logical] = excel_name
 
         return mapping
+
+    def load_controls_df(self) -> pd.DataFrame:
+        """
+        Load the Controls sheet from MUNI_MASTER_BUCKET.
+
+        Expected columns (flexible naming):
+          - Control / ControlName / Name / Key
+          - Value
+        """
+        if self.master_bucket is None:
+            raise ValueError("master_bucket configuration not set in YAML.")
+
+        mb = self.master_bucket
+        df = pd.read_excel(mb.file, sheet_name=mb.controls_sheet)
+        return df
+
+    def get_control_value(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        """
+        Look up a value in the Controls sheet by control name.
+
+        Example usage:
+            app_cfg.get_control_value("CURVE_ASOF_DATE")
+
+        Returns string or default if not found.
+        """
+        try:
+            df = self.load_controls_df()
+        except Exception:
+            return default
+
+        # Normalise column names
+        norm = {c.lower().replace(" ", ""): c for c in df.columns}
+
+        key_col = None
+        val_col = None
+        for candidate in ("control", "controlname", "name", "key"):
+            if candidate in norm:
+                key_col = norm[candidate]
+                break
+        for candidate in ("value", "val"):
+            if candidate in norm:
+                val_col = norm[candidate]
+                break
+
+        if key_col is None or val_col is None:
+            return default
+
+        mask = df[key_col].astype(str).str.strip().str.upper() == name.upper()
+        sub = df.loc[mask]
+        if sub.empty:
+            return default
+
+        val = sub.iloc[0][val_col]
+        if pd.isna(val):
+            return default
+
+        return str(val)
