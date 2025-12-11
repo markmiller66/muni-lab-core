@@ -1,53 +1,44 @@
-"""
-Curve loading and zero-curve utilities for muni_core.
+""""
+Curve loading, history, and short-rate utilities for muni_core (muni-lab-core).
 """
 
 from .types import CurvePoint, ZeroCurve
 from .zero_curve import make_zero_curve_from_pairs
-from .loader import (
-    CurveConfig,
-    load_zero_curve_from_spot_excel,
-    build_default_curve_config,
-    load_zero_curve_from_app_config,
-)
-from .forward_helpers import (
-    year_fraction,
-    forward_rate_between_dates,
-    forward_rate_to_date,
-    forward_curve_grid,
-    forward_at_call,
-    forward_after_call,
-    forward_slope_around_call_bp,
+from .history import (
+    build_historical_curves,
+    get_zero_curve_for_date,
+    export_spot_curves_and_spreads,
+    export_dense_curve_and_forward_matrix,
 )
 
-# NEW: short-rate / Hull–White helper imports
-from .short_rate import (
-    SanitizedCurve,
-    make_time_grid,
-    discount_factor_grid,
-    forward_rate_grid,
-    HullWhite1FParams,
+
+from .short_rate_lattice import (
+    ShortRateLattice,
+    build_hw_short_rate_lattice,
+    build_state_price_tree_from_lattice,
+    build_short_rate_path_from_hw,
+    build_binomial_lattice_from_hw,   # add
 )
+
+
 
 __all__ = [
+    # basic curve types
     "CurvePoint",
     "ZeroCurve",
     "make_zero_curve_from_pairs",
-    "CurveConfig",
-    "load_zero_curve_from_spot_excel",
-    "build_default_curve_config",
-    "load_zero_curve_from_app_config",
-    "year_fraction",
-    "forward_rate_between_dates",
-    "forward_rate_to_date",
-    "forward_curve_grid",
-    "forward_at_call",
-    "forward_after_call",
-    "forward_slope_around_call_bp",
-    # NEW exports
-    "SanitizedCurve",
-    "make_time_grid",
-    "discount_factor_grid",
-    "forward_rate_grid",
-    "HullWhite1FParams",
+
+    # historical curve building + exports
+    "build_historical_curves",
+    "get_zero_curve_for_date",
+    "export_spot_curves_and_spreads",
+    "export_dense_curve_and_forward_matrix",
+
+    # short-rate lattice + state prices
+    "ShortRateLattice",
+    "build_hw_short_rate_lattice",
+    "build_state_price_tree_from_lattice",
+    "build_short_rate_path_from_hw",
+    "build_binomial_lattice_from_hw",
+
 ]

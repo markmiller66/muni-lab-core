@@ -2,252 +2,240 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import List
 
 import numpy as np
 import pandas as pd
 
-from muni_core.config.loader import AppConfig
-from muni_core.curves.history import (
-    build_dense_zero_curve_for_date,
-    build_hw_theta_from_dense,
-)
 
-
-def build_short_rate_path_from_hw(hw_df: pd.DataFrame) -> pd.DataFrame:
+@dataclass
+class ShortRateLattice:
     """
-    Build a *deterministic* short-rate path from the HW output.
+    Simple recombining short-rate lattice:
 
-    We approximate the short rate r(t) by the instantaneous forward rate
-    f(0,t) in the 'inst_fwd' column. If 'inst_fwd' is missing, we fall
-    back to the zero yield 'rate_dec'.
+        rates[t][j] = short rate at time step t, node j
 
-    Parameters
-    ----------
-    hw_df : DataFrame
-        Columns: date, tenor_yrs, rate_dec, df, inst_fwd, df_dt, theta
-
-    Returns
-    -------
-    DataFrame
-        Columns:
-            step     : integer time step index (0..N-1)
-            t_yrs    : time in years
-            r_short  : short rate at that step (decimal)
+    with constant time step dt_years.
     """
-    if hw_df.empty:
-        raise ValueError("hw_df is empty; cannot build short-rate path.")
-
-    df = hw_df.copy()
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    df = df.sort_values("tenor_yrs").reset_index(drop=True)
-
-    if "inst_fwd" in df.columns and not df["inst_fwd"].isna().all():
-        r = df["inst_fwd"].to_numpy(dtype=float)
-    else:
-        # fallback: use zero yields
-        r = df["rate_dec"].to_numpy(dtype=float)
-
-    t = df["tenor_yrs"].to_numpy(dtype=float)
-
-    steps = np.arange(len(t), dtype=int)
-
-    out = pd.DataFrame(
-        {
-            "step": steps,
-            "t_yrs": t,
-            "r_short": r,
-        }
-    )
-    return out
+    dt_years: float
+    rates: List[List[float]]  # rates[time_step][node]
 
 
-def build_binomial_lattice_from_hw(
-    hw_df: pd.DataFrame,
+def build_hw_short_rate_lattice(
+    dense_df: pd.DataFrame,
+    a: float,
     sigma: float,
-    dt: float,
-) -> pd.DataFrame:
+    dt_years: float = 1.0,
+) -> ShortRateLattice:
     """
-    Build a simple *recombining binomial* short-rate lattice using
-    a Hull–White-style baseline path from f(0,t) (inst_fwd) and a
-    constant volatility sigma.
+    Build a very simple Hull–White-style short-rate lattice from a dense
+    zero curve.
 
-    This is an initial lattice suitable for experimentation and will
-    later be refined (e.g., full HW calibration, probabilities, etc.).
+    dense_df is expected to have columns:
+        - tenor_yrs (float)
+        - rate_dec  (zero yield in decimal)
 
-    Construction:
-      - For each time step n, define a "mid" rate r_mid(n) from inst_fwd.
-      - Node indices j = -n, ..., +n
-      - Short rate at node (n, j):
-            r(n, j) = r_mid(n) + j * (sigma * sqrt(dt))
+    This is intentionally *simple* and meant as a wiring + sanity-check
+    implementation, not a production-calibrated HW model:
 
-      - This produces a recombining tree in j.
+      1. We take the dense zero curve, sorted by tenor_yrs.
+      2. For each time step t_k = (k+1) * dt_years, we linearly interpolate
+         the zero rate z(t_k).
+      3. That interpolated rate is used as a "base" short rate at that step.
+      4. Node j at level k gets:
 
-    Parameters
-    ----------
-    hw_df : DataFrame
-        HW output for a single as-of date (one date), columns including:
-            tenor_yrs, inst_fwd (or rate_dec as fallback)
-    sigma : float
-        Short-rate volatility (decimal per year).
-    dt : float
-        Time step size in years (e.g., 0.5).
+             r(k, j) = base_k + (2*j - k) * sigma * sqrt(dt_years)
 
-    Returns
-    -------
-    DataFrame
-        Columns:
-            step     : integer time step index (0..N-1)
-            t_yrs    : time in years at this step
-            j        : node index at this step (-step .. +step)
-            r_short  : short rate at that node (decimal)
+         which creates a recombining binomial tree with volatility sigma.
+
+    The 'a' parameter (mean reversion) is accepted here but not yet used,
+    so that in the future you can upgrade this to a proper calibrated
+    Hull–White construction without changing the public interface.
     """
-    if hw_df.empty:
-        raise ValueError("hw_df is empty; cannot build binomial lattice.")
+    if dense_df.empty:
+        raise ValueError("dense_df is empty; cannot build short-rate lattice.")
 
-    if sigma < 0.0:
-        raise ValueError(f"sigma must be >= 0, got {sigma}.")
-    if dt <= 0.0:
-        raise ValueError(f"dt must be > 0, got {dt}.")
+    df = dense_df.copy()
+    df = df.sort_values("tenor_yrs")
 
-    df = hw_df.copy()
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    df = df.sort_values("tenor_yrs").reset_index(drop=True)
+    tenors = df["tenor_yrs"].to_numpy(dtype=float)
+    rates = df["rate_dec"].to_numpy(dtype=float)
 
-    if "inst_fwd" in df.columns and not df["inst_fwd"].isna().all():
-        r_mid_all = df["inst_fwd"].to_numpy(dtype=float)
-    else:
-        r_mid_all = df["rate_dec"].to_numpy(dtype=float)
+    if len(tenors) < 2:
+        raise ValueError("Need at least 2 tenor points in dense_df to build lattice.")
 
-    t_all = df["tenor_yrs"].to_numpy(dtype=float)
-    n_steps = len(t_all)
+    if dt_years <= 0.0:
+        raise ValueError(f"dt_years must be positive, got {dt_years}.")
 
-    up_step = sigma * np.sqrt(dt)
+    # We'll build steps up to the max tenor covered by the dense curve.
+    max_T = float(tenors.max())
+    n_steps = int(max_T // dt_years)
+    if n_steps < 1:
+        raise ValueError(
+            f"Not enough horizon for dt_years={dt_years}; max tenor is {max_T}."
+        )
 
-    records: list[dict] = []
+    # Interpolator for zero rates z(t)
+    times = np.asarray(tenors, dtype=float)
+    zr = np.asarray(rates, dtype=float)
 
-    for n in range(n_steps):
-        t_n = t_all[n]
-        r_mid = r_mid_all[n]
+    def z_of_t(t: float) -> float:
+        # clip to the available range to avoid NaNs at edges
+        t_clipped = np.clip(t, times.min(), times.max())
+        return float(np.interp(t_clipped, times, zr))
 
-        # recombining node indices for this step
-        # j = -n, ..., +n
-        for j in range(-n, n + 1):
-            r_ij = r_mid + j * up_step
+    lattice_rates: List[List[float]] = []
 
-            records.append(
-                {
-                    "step": n,
-                    "t_yrs": t_n,
-                    "j": j,
-                    "r_short": r_ij,
-                }
-            )
+    # sigma * sqrt(dt) used as the per-step shift magnitude
+    shift_unit = sigma * np.sqrt(dt_years)
 
-    lattice_df = pd.DataFrame.from_records(records)
-    lattice_df.sort_values(["step", "j"], inplace=True)
-    lattice_df.reset_index(drop=True, inplace=True)
-    return lattice_df
+    for k in range(n_steps):
+        t_k = (k + 1) * dt_years  # time at this step
+        base_k = z_of_t(t_k)
+        level_rates: List[float] = []
+        for j in range(k + 1):
+            # simple symmetric binomial around base_k
+            shift = (2 * j - k) * shift_unit
+            level_rates.append(base_k + shift)
+        lattice_rates.append(level_rates)
+
+    return ShortRateLattice(dt_years=dt_years, rates=lattice_rates)
 
 
-def export_hw_lattice_for_asof(
-    history_df: pd.DataFrame,
-    app_cfg: AppConfig,
-    curve_key: str = "AAA_MUNI_SPOT",
-    step_years: float = 0.5,
-) -> None:
+def build_state_price_tree_from_lattice(
+    lattice: ShortRateLattice,
+    p_up: float = 0.5,
+) -> List[List[float]]:
     """
-    High-level helper:
-      - takes historical curves table
-      - chooses CURVE_ASOF_DATE
-      - builds dense zero curve
-      - builds HW theta grid
-      - builds deterministic short-rate path
-      - builds simple binomial lattice
-      - exports all to the dated HW folder.
+    Build a state price tree from a short-rate lattice.
 
-    Controls used (MUNI_MASTER_BUCKET Controls sheet):
+    We assume a recombining binomial structure:
 
-        CURVE_ASOF_DATE
-        HW_A
-        HW_SIGMA_BASE
+      - From node (t, j) you can go to:
+            (t+1, j)   with probability (1 - p_up)
+            (t+1, j+1) with probability p_up
 
-    Outputs into:
-        <repo_root>/output/curves/<CURVE_ASOF_DATE>/hw/
+      - Discounting uses the short rate r(t, j) at the *start* of the period:
 
-      - hw_theta_<curve_key>_<asof>.parquet   (already produced elsewhere)
-      - hw_lattice_path_<curve_key>_<asof>.parquet
-      - hw_lattice_tree_<curve_key>_<asof>.parquet
-      - hw_lattice_<curve_key>_<asof>.xlsx
-          * PATH sheet  : step, t_yrs, r_short
-          * LATTICE sheet: step, t_yrs, j, r_short
+            state_price(t+1, node) += state_price(t, j)
+                                      * prob
+                                      * exp(-r(t,j) * dt)
+
+    This is *not* a fully calibrated risk-neutral HW model, but it
+    provides a clean and deterministic mapping from (rates, dt) ->
+    state prices that you can plug into the bond pricer.
+
+    Returns:
+        state_prices[t][j] = state price at time step t, node j.
     """
-    curves_cfg = app_cfg.curves
+    dt = lattice.dt_years
+    rates = lattice.rates
 
-    # Resolve as-of date: prefer CURVE_ASOF_DATE from YAML / Controls
-    if curves_cfg.curve_asof_date:
-        asof = pd.to_datetime(curves_cfg.curve_asof_date).date()
-    else:
-        df_local = history_df.copy()
-        df_local["date"] = pd.to_datetime(df_local["date"]).dt.date
-        asof = df_local["date"].max()
+    n_levels = len(rates)
+    if n_levels == 0:
+        raise ValueError("ShortRateLattice has no levels.")
 
-    # HW parameters from Controls, with same defaults used elsewhere
-    a_raw: Optional[str] = None
-    sigma_raw: Optional[str] = None
-    try:
-        if hasattr(app_cfg, "get_control_value"):
-            a_raw = app_cfg.get_control_value("HW_A", default=None)
-            sigma_raw = app_cfg.get_control_value("HW_SIGMA_BASE", default=None)
-    except Exception:
-        a_raw = None
-        sigma_raw = None
+    # Initialize state price tree
+    state_prices: List[List[float]] = []
+    state_prices.append([1.0])  # at t=0, single node with state price 1.0
 
-    a = float(a_raw) if a_raw not in (None, "") else 0.10
-    sigma = float(sigma_raw) if sigma_raw not in (None, "") else 0.01
+    for t in range(n_levels):
+        current_rates = rates[t]
+        current_states = state_prices[t]
+        n_nodes = len(current_states)
 
-    print(f"[INFO] HW lattice params: a={a:.6f}, sigma={sigma:.6f}, asof={asof}, dt={step_years}")
+        # next level has n_nodes + 1 nodes
+        next_states = [0.0] * (n_nodes + 1)
 
-    # --- Build dense zero curve for this date/curve ---
-    dense_df = build_dense_zero_curve_for_date(
-        history_df=history_df,
-        curve_key=curve_key,
-        target_date=asof,
-        step_years=step_years,
+        for j in range(n_nodes):
+            r_tj = current_rates[j]
+            pi_tj = current_states[j]
+
+            # discount factor for this step
+            disc = float(np.exp(-r_tj * dt))
+
+            # down move: (t+1, j)
+            next_states[j] += pi_tj * (1.0 - p_up) * disc
+            # up move: (t+1, j+1)
+            next_states[j + 1] += pi_tj * p_up * disc
+
+        state_prices.append(next_states)
+
+    return state_prices
+
+def build_short_rate_path_from_hw(
+    dense_df: pd.DataFrame,
+    a: float,
+    sigma: float,
+    dt_years: float = 1.0,
+):
+    """
+    Convenience helper retained for backward compatibility with older code.
+
+    Given a dense zero curve (tenor_yrs, rate_dec) and Hull–White params
+    (a, sigma, dt_years), this:
+
+      1) Builds a ShortRateLattice via build_hw_short_rate_lattice.
+      2) Extracts a single "central" short-rate path r(t_k):
+            - time grid t_k = (k+1) * dt_years
+            - r_path[k] = rate at the middle node of level k
+
+    Returns:
+        times  (np.ndarray): shape (n_steps,), time in years
+        r_path (np.ndarray): shape (n_steps,), short rate at each step
+    """
+    # 1) Build the lattice
+    lattice = build_hw_short_rate_lattice(
+        dense_df=dense_df,
+        a=a,
+        sigma=sigma,
+        dt_years=dt_years,
     )
 
-    # --- Build HW theta grid from dense curve ---
-    hw_df = build_hw_theta_from_dense(dense_df, a=a, sigma=sigma)
+    levels = lattice.rates
+    n_steps = len(levels)
+    if n_steps == 0:
+        raise ValueError("ShortRateLattice has no levels in build_short_rate_path_from_hw.")
 
-    # --- Deterministic short-rate path ---
-    path_df = build_short_rate_path_from_hw(hw_df)
+    # 2) Time grid: t_k = (k+1) * dt
+    times = np.array([(k + 1) * lattice.dt_years for k in range(n_steps)], dtype=float)
 
-    # --- Simple binomial lattice around that path ---
-    lattice_df = build_binomial_lattice_from_hw(hw_df, sigma=sigma, dt=step_years)
+    # 3) "Central" path: middle node at each level
+    r_path = []
+    for level in levels:
+        j_mid = len(level) // 2
+        r_path.append(float(level[j_mid]))
 
-    # --- Export under dated HW folder ---
-    base = app_cfg.dated_output_root
-    outdir = base / "hw"
-    outdir.mkdir(parents=True, exist_ok=True)
+    r_path = np.array(r_path, dtype=float)
 
-    safe_key = curve_key.replace(" ", "_")
-    date_str = asof.isoformat()
+    return times, r_path
+def build_binomial_lattice_from_hw(
+    dense_df: pd.DataFrame,
+    a: float,
+    sigma: float,
+    dt_years: float = 1.0,
+):
+    """
+    Backward-compatibility alias for older code that expected a
+    'build_binomial_lattice_from_hw' helper.
 
-    path_parquet = outdir / f"hw_lattice_path_{safe_key}_{date_str}.parquet"
-    tree_parquet = outdir / f"hw_lattice_tree_{safe_key}_{date_str}.parquet"
-    xlsx_path = outdir / f"hw_lattice_{safe_key}_{date_str}.xlsx"
+    In this muni-lab-core version, we treat it as a thin wrapper around
+    build_hw_short_rate_lattice and simply return the ShortRateLattice
+    object.
 
-    path_df.to_parquet(path_parquet)
-    lattice_df.to_parquet(tree_parquet)
+    Args:
+        dense_df: DataFrame with columns [tenor_yrs, rate_dec] for a single date.
+        a:       Hull–White mean reversion speed.
+        sigma:   Hull–White short rate volatility.
+        dt_years: Time step in years (1.0 = annual, 0.5 = semi-annual).
 
-    # Excel for human inspection
-    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-        path_df.to_excel(writer, sheet_name="PATH", index=False)
-        lattice_df.to_excel(writer, sheet_name="LATTICE", index=False)
-
-    print(
-        f"[OK] Exported HW short-rate path and binomial lattice for {curve_key} @ {asof} to\n"
-        f"      {path_parquet}\n"
-        f"      {tree_parquet}\n"
-        f"      {xlsx_path}"
+    Returns:
+        ShortRateLattice instance.
+    """
+    return build_hw_short_rate_lattice(
+        dense_df=dense_df,
+        a=a,
+        sigma=sigma,
+        dt_years=dt_years,
     )

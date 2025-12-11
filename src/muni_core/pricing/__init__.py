@@ -1,5 +1,3 @@
-# src/muni_core/pricing/__init__.py
-
 from .hw_bond_pricer import (
     BondCashflowSchedule,
     build_level_coupon_schedule,
@@ -15,3 +13,4 @@ __all__ = [
     "price_cashflows_from_dense_zero",
     "price_level_coupon_bond_hw",
 ]
+

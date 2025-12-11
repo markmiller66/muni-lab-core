@@ -3,110 +3,133 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date as date_type
-from typing import Sequence, Optional, Dict, Tuple
+from typing import List, Sequence, Optional
 
 import numpy as np
 import pandas as pd
-
-from muni_core.config.loader import AppConfig
-from muni_core.curves.history import (
-    build_dense_zero_curve_for_date,
-    build_hw_theta_from_dense,
-)
-from muni_core.curves.short_rate_lattice import (
-    build_short_rate_path_from_hw,
-    build_binomial_lattice_from_hw,
-    build_state_price_tree_from_lattice,
-)
 
 
 # -------------------------------------------------------------------
 # Core cashflow representation
 # -------------------------------------------------------------------
 
+
 @dataclass
 class BondCashflowSchedule:
     """
-    Simple representation of a bond's projected cashflows
-    relative to the as-of date (in *years*).
+    Simple container for a level-coupon bond's cashflow schedule.
 
-    t_yrs: array of payment times in years (e.g., 0.5, 1.0, ..., 10.0)
-    amounts: array of cashflows at those times (coupon + principal)
+    t_yrs         : payment times in years
+    amounts       : cashflow amounts at those times
+    face_value    : principal repaid at maturity
+    coupon_rate   : annual coupon rate (decimal)
+    freq_per_year : number of coupon payments per year
+    maturity_years: final maturity in years
     """
-    t_yrs: np.ndarray
-    amounts: np.ndarray
-
-    def __post_init__(self) -> None:
-        self.t_yrs = np.asarray(self.t_yrs, dtype=float)
-        self.amounts = np.asarray(self.amounts, dtype=float)
-        if self.t_yrs.shape != self.amounts.shape:
-            raise ValueError(
-                f"t_yrs and amounts must have same shape, got "
-                f"{self.t_yrs.shape} vs {self.amounts.shape}"
-            )
+    t_yrs: List[float]
+    amounts: List[float]
+    face_value: float
+    coupon_rate: float
+    freq_per_year: int
+    maturity_years: float
 
     @classmethod
-    def from_dataframe(cls, df: pd.DataFrame) -> "BondCashflowSchedule":
-        """
-        Expect columns: 't_yrs' and 'amount'
-        """
-        if "t_yrs" not in df.columns or "amount" not in df.columns:
-            raise ValueError("DataFrame must contain 't_yrs' and 'amount' columns.")
+    def from_arrays(
+        cls,
+        t_yrs: Sequence[float],
+        amounts: Sequence[float],
+        face_value: float,
+        coupon_rate: float,
+        freq_per_year: int,
+        maturity_years: float,
+    ) -> "BondCashflowSchedule":
         return cls(
-            t_yrs=df["t_yrs"].to_numpy(dtype=float),
-            amounts=df["amount"].to_numpy(dtype=float),
+            list(t_yrs),
+            list(amounts),
+            float(face_value),
+            float(coupon_rate),
+            int(freq_per_year),
+            float(maturity_years),
         )
 
     def to_dataframe(self) -> pd.DataFrame:
         return pd.DataFrame({"t_yrs": self.t_yrs, "amount": self.amounts})
 
 
+# -------------------------------------------------------------------
+# Schedule builder
+# -------------------------------------------------------------------
+
+
 def build_level_coupon_schedule(
     maturity_years: float,
     coupon_rate: float,
     freq_per_year: int = 2,
-    face: float = 100.0,
+    dt_years: Optional[float] = None,
+    face_value: float = 100.0,
 ) -> BondCashflowSchedule:
     """
-    Build a standard *level coupon* schedule:
+    Build a simple level-coupon bond schedule.
 
-      - maturity_years: final maturity (time from as-of in years)
-      - coupon_rate   : annual coupon rate (e.g. 0.04 for 4%)
-      - freq_per_year : coupon frequency (2 = semiannual)
-      - face          : principal amount
+    Args:
+        maturity_years: final maturity in years.
+        coupon_rate:    annual coupon rate (decimal, e.g. 0.04).
+        freq_per_year:  number of coupon payments per year (2 = semi-annual).
+        dt_years:       OPTIONAL time step (years). If provided, we infer
+                        freq_per_year = round(1 / dt_years).
+        face_value:     principal repaid at maturity (default 100.0).
 
-    This ignores stub periods and assumes exact integer number of periods:
-
-      n_periods = round(maturity_years * freq_per_year)
-
-      t_k = k / freq_per_year, k=1..n_periods
-      CF_k = coupon_rate * face / freq_per_year
-      CF_last += face
+    Returns:
+        BondCashflowSchedule with t_yrs, amounts, and face_value.
     """
-    if maturity_years <= 0:
-        raise ValueError("maturity_years must be > 0")
-    if freq_per_year <= 0:
-        raise ValueError("freq_per_year must be > 0")
+    # --- interpret dt_years if provided ---
+    if dt_years is not None:
+        if dt_years <= 0:
+            raise ValueError("dt_years must be positive.")
+        freq = int(round(1.0 / dt_years))
+        if freq <= 0:
+            freq = 1
+        freq_per_year = freq
 
+    face = float(face_value)
+
+    # Time between coupons
+    dt = 1.0 / float(freq_per_year)
+
+    # Coupon per period (level coupon)
+    coupon = face * float(coupon_rate) / float(freq_per_year)
+
+    # Build times and cashflows
     n_periods = int(round(maturity_years * freq_per_year))
     if n_periods <= 0:
-        raise ValueError(
-            f"Computed n_periods={n_periods} from maturity_years={maturity_years}, "
-            f"freq_per_year={freq_per_year}"
-        )
+        raise ValueError("maturity_years * freq_per_year must be > 0")
 
-    t_yrs = np.arange(1, n_periods + 1, dtype=float) / float(freq_per_year)
-    coupon = face * coupon_rate / float(freq_per_year)
-    amounts = np.full(n_periods, coupon, dtype=float)
-    amounts[-1] += face
+    t_yrs: list[float] = []
+    amounts: list[float] = []
 
-    return BondCashflowSchedule(t_yrs=t_yrs, amounts=amounts)
+    for k in range(1, n_periods + 1):
+        t = k * dt
+        t_yrs.append(t)
+
+        cf = coupon
+        if k == n_periods:
+            cf += face  # add principal at maturity
+        amounts.append(cf)
+
+    return BondCashflowSchedule(
+        t_yrs=t_yrs,
+        amounts=amounts,
+        face_value=face,
+        coupon_rate=coupon_rate,
+        freq_per_year=freq_per_year,
+        maturity_years=maturity_years,
+    )
 
 
 # -------------------------------------------------------------------
 # Pricing from state-price tree
 # -------------------------------------------------------------------
+
 
 def _discount_factors_from_state_tree(
     state_tree_df: pd.DataFrame,
@@ -157,22 +180,6 @@ def price_cashflows_from_state_tree(
       - For each cashflow time t_k, we find the *nearest* tree tenor t_n
         and use DF(t_n), with an optional sanity check that the gap
         is not too large (time_tolerance).
-
-    Parameters
-    ----------
-    state_tree_df : DataFrame
-        Columns include at least: 't_yrs', 'state_price'.
-    schedule : BondCashflowSchedule
-        Cashflow times and amounts (in years from as-of).
-    time_tolerance : float
-        If the nearest tree tenor differs from t_k by more than this,
-        we *warn* via print; pricing still proceeds but it’s a flag
-        for misalignment.
-
-    Returns
-    -------
-    float
-        Present value of the cashflow schedule.
     """
     df_curve = _discount_factors_from_state_tree(state_tree_df)
 
@@ -204,6 +211,7 @@ def price_cashflows_from_state_tree(
 # Pricing directly from dense zero curve (for cross-checks)
 # -------------------------------------------------------------------
 
+
 def price_cashflows_from_dense_zero(
     dense_df: pd.DataFrame,
     schedule: BondCashflowSchedule,
@@ -216,7 +224,7 @@ def price_cashflows_from_dense_zero(
 
         dense_df: columns 'tenor_yrs', 'rate_dec' (zero yield in decimal)
 
-    We use continuous compounding consistent with the HW build:
+    We use continuous compounding (consistent with typical HW builds):
 
         DF(0, t) = exp(-z(t) * t)
 
@@ -232,7 +240,6 @@ def price_cashflows_from_dense_zero(
     dense.sort_values("tenor_yrs", inplace=True)
     dense.reset_index(drop=True, inplace=True)
 
-    # piecewise monotone interpolation of zero rates
     from scipy.interpolate import PchipInterpolator
 
     tenors = dense["tenor_yrs"].to_numpy(dtype=float)
@@ -250,112 +257,104 @@ def price_cashflows_from_dense_zero(
 
 
 # -------------------------------------------------------------------
-# High-level convenience: build HW lattice + price coupon bond
+# Thin wrapper for tests: price via HW state-price tree
 # -------------------------------------------------------------------
 
+
 def price_level_coupon_bond_hw(
-    history_df: pd.DataFrame,
-    app_cfg: AppConfig,
-    maturity_years: float,
-    coupon_rate: float,
-    freq_per_year: int = 2,
-    face: float = 100.0,
-    curve_key: str = "AAA_MUNI_SPOT",
-    step_years: float = 0.5,
-    q: float = 0.5,
+    schedule: BondCashflowSchedule,
+    state_prices,
+    time_tolerance: float = 1e-6,
 ) -> float:
     """
-    End-to-end helper for a *toy* level-coupon bond:
+    Thin wrapper used in tests:
 
-      1. Choose as-of date (CURVE_ASOF_DATE or max(history_df.date)).
-      2. Build dense zero curve for (asof, curve_key).
-      3. Build HW theta grid from dense.
-      4. Build short-rate path + binomial lattice.
-      5. Build state-price tree matching the dense zero DF.
-      6. Build level coupon schedule from 0..maturity_years.
-      7. Price with state prices.
+      - 'schedule' is a BondCashflowSchedule
+      - 'state_prices' can be either:
+          * a pandas DataFrame with columns ['t_yrs', 'state_price'], OR
+          * a list-of-lists of Arrow–Debreu prices per time step
+            (levels 0..N), where level n has n+1 state prices.
 
-    This does *not* yet know about real bonds, call schedules,
-    or actual calendar dates. It’s meant as a “lab-core” pricing
-    building block and sanity check that the lattice is consistent.
-
-    Parameters
-    ----------
-    history_df : DataFrame
-        Long-form historical curve table built by build_historical_curves.
-    app_cfg : AppConfig
-        Configuration object with CURVE_ASOF_DATE and HW params.
-    maturity_years : float
-        Time from as-of to final maturity (years).
-    coupon_rate : float
-        Annual coupon rate (e.g. 0.04 for 4%).
-    freq_per_year : int
-        Coupon frequency (2 = semiannual).
-    face : float
-        Face value.
-    curve_key : str
-        Which curve in history_df to use (default AAA_MUNI_SPOT).
-    step_years : float
-        Lattice time step (0.5 = semiannual).
-    q : float
-        Baseline up probability in HW tree (shape parameter, not DF).
-
-    Returns
-    -------
-    float
-        HW-lattice price of the level coupon bond.
+    We convert whatever we get into a DataFrame and then delegate to
+    price_cashflows_from_state_tree.
     """
-    curves_cfg = app_cfg.curves
+    # Case 1: already a DataFrame with the right columns
+    if isinstance(state_prices, pd.DataFrame):
+        df = state_prices
+        # if it already has 't_yrs' and 'state_price', just use it
+        if {"t_yrs", "state_price"}.issubset(df.columns):
+            return price_cashflows_from_state_tree(
+                state_tree_df=df,
+                schedule=schedule,
+                time_tolerance=time_tolerance,
+            )
+        # Otherwise try to coerce
+        elif "time" in df.columns and "price" in df.columns:
+            df2 = df.rename(columns={"time": "t_yrs", "price": "state_price"})[
+                ["t_yrs", "state_price"]
+            ]
+            return price_cashflows_from_state_tree(
+                state_tree_df=df2,
+                schedule=schedule,
+                time_tolerance=time_tolerance,
+            )
+        else:
+            raise ValueError(
+                "state_prices DataFrame must contain either "
+                "['t_yrs', 'state_price'] or ['time', 'price']."
+            )
 
-    # --- As-of date ---
-    if curves_cfg.curve_asof_date:
-        asof = pd.to_datetime(curves_cfg.curve_asof_date).date()
-    else:
-        history_df_local = history_df.copy()
-        history_df_local["date"] = pd.to_datetime(history_df_local["date"]).dt.date
-        asof = history_df_local["date"].max()
+    # Case 2: list-like input (what tests are currently using)
+    # Expected shape: levels[0..N], each level is a list of state prices
+    if isinstance(state_prices, (list, tuple)):
+        # If it's a list of dicts, try DataFrame directly
+        if state_prices and isinstance(state_prices[0], dict):
+            df = pd.DataFrame(state_prices)
+            if {"t_yrs", "state_price"}.issubset(df.columns):
+                return price_cashflows_from_state_tree(
+                    state_tree_df=df,
+                    schedule=schedule,
+                    time_tolerance=time_tolerance,
+                )
+            else:
+                raise ValueError(
+                    "List-of-dicts state_prices must have keys 't_yrs' and 'state_price'."
+                )
 
-    # --- HW parameters from Controls (or defaults) ---
-    a_raw: Optional[str] = None
-    sigma_raw: Optional[str] = None
-    try:
-        if hasattr(app_cfg, "get_control_value"):
-            a_raw = app_cfg.get_control_value("HW_A", default=None)
-            sigma_raw = app_cfg.get_control_value("HW_SIGMA_BASE", default=None)
-    except Exception:
-        a_raw = None
-        sigma_raw = None
+        # Otherwise we assume list-of-lists: levels of the tree
+        levels = state_prices
+        n_levels = len(levels) - 1  # level 0..N => N time steps
+        if n_levels <= 0:
+            raise ValueError("state_prices list must contain at least 2 levels.")
 
-    a = float(a_raw) if a_raw not in (None, "") else 0.10
-    sigma = float(sigma_raw) if sigma_raw not in (None, "") else 0.01
+        # Use the bond's maturity to infer dt
+        maturity_years = float(schedule.maturity_years)
+        dt = maturity_years / float(n_levels)
 
-    # --- Dense zero curve for as-of / curve_key ---
-    dense_df = build_dense_zero_curve_for_date(
-        history_df=history_df,
-        curve_key=curve_key,
-        target_date=asof,
-        step_years=step_years,
+        records = []
+        for level_idx, row in enumerate(levels):
+            t = level_idx * dt  # time at this level
+            # row is expected to be a sequence of state prices at this level
+            for j, sp in enumerate(row):
+                records.append(
+                    {
+                        "t_yrs": float(t),
+                        "state_price": float(sp),
+                        "level": int(level_idx),
+                        "state_index": int(j),
+                    }
+                )
+
+        df_states = pd.DataFrame.from_records(records)
+
+        return price_cashflows_from_state_tree(
+            state_tree_df=df_states,
+            schedule=schedule,
+            time_tolerance=time_tolerance,
+        )
+
+    # Fallback: unsupported type
+    raise TypeError(
+        f"Unsupported state_prices type: {type(state_prices)}. "
+        "Expected DataFrame or list-of-lists."
     )
-
-    # --- HW theta grid and short-rate machinery ---
-    hw_df = build_hw_theta_from_dense(dense_df, a=a, sigma=sigma)
-    _path_df = build_short_rate_path_from_hw(hw_df)
-    lattice_df = build_binomial_lattice_from_hw(hw_df, sigma=sigma, dt=step_years)
-    state_tree_df = build_state_price_tree_from_lattice(
-        lattice_df=lattice_df,
-        dense_df=dense_df,
-        dt=step_years,
-        q=q,
-    )
-
-    # --- Build coupon schedule and price ---
-    schedule = build_level_coupon_schedule(
-        maturity_years=maturity_years,
-        coupon_rate=coupon_rate,
-        freq_per_year=freq_per_year,
-        face=face,
-    )
-
-    price_hw = price_cashflows_from_state_tree(state_tree_df, schedule)
-
-    return price_hw
