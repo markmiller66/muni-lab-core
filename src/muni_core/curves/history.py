@@ -711,6 +711,166 @@ def build_forward_matrix_from_dense(
         out.reset_index(drop=True, inplace=True)
     return out
 
+def export_hw_theta_for_asof(
+    history_df: pd.DataFrame,
+    app_cfg: AppConfig,
+    curve_key: str = "AAA_MUNI_SPOT",
+    step_years: float = 0.5,
+) -> None:
+    """
+    For the current CURVE_ASOF_DATE, build a dense zero curve for `curve_key`
+    (default AAA_MUNI_SPOT), derive the instantaneous forward curve f(0,t)
+    and Hull–White theta(t), and export to:
+
+        <repo_root>/output/curves/<CURVE_ASOF_DATE>/hw/
+
+    Controls used (in MUNI_MASTER_BUCKET Controls):
+
+        CURVE_ASOF_DATE   (required, YYYY-MM-DD)
+        HW_A              (optional, mean reversion; default 0.10)
+        HW_SIGMA_BASE     (optional, volatility; default 0.01)
+
+    Outputs:
+
+        - hw_theta_<curve_key>_<asof>.parquet
+        - hw_theta_<curve_key>_<asof>.xlsx
+    """
+    curves_cfg = app_cfg.curves
+
+    # Resolve as-of date: from CURVE_ASOF_DATE in YAML or Controls
+    if curves_cfg.curve_asof_date:
+        asof = pd.to_datetime(curves_cfg.curve_asof_date).date()
+    else:
+        # fall back to max date in history
+        df_local = history_df.copy()
+        df_local["date"] = pd.to_datetime(df_local["date"]).dt.date
+        asof = df_local["date"].max()
+
+    # HW parameters from Controls, with safe defaults
+    a_raw = None
+    sigma_raw = None
+    try:
+        if hasattr(app_cfg, "get_control_value"):
+            a_raw = app_cfg.get_control_value("HW_A", default=None)
+            sigma_raw = app_cfg.get_control_value("HW_SIGMA_BASE", default=None)
+    except Exception:
+        a_raw = None
+        sigma_raw = None
+
+    a = float(a_raw) if a_raw not in (None, "") else 0.10
+    sigma = float(sigma_raw) if sigma_raw not in (None, "") else 0.01
+
+    print(f"[INFO] HW params: a={a:.6f}, sigma={sigma:.6f}, asof={asof}")
+
+    # Dense zero curve at semi-annual spacing
+    dense_df = build_dense_zero_curve_for_date(
+        history_df=history_df,
+        curve_key=curve_key,
+        target_date=asof,
+        step_years=step_years,
+    )
+
+    hw_df = build_hw_theta_from_dense(dense_df, a=a, sigma=sigma)
+
+    base = app_cfg.dated_output_root
+    outdir = base / "hw"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    safe_key = curve_key.replace(" ", "_")
+    date_str = asof.isoformat()
+
+    parquet_path = outdir / f"hw_theta_{safe_key}_{date_str}.parquet"
+    xlsx_path = outdir / f"hw_theta_{safe_key}_{date_str}.xlsx"
+
+    hw_df.to_parquet(parquet_path)
+
+    # Excel for inspection
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        hw_df.to_excel(writer, sheet_name="HW_THETA", index=False)
+
+    print(
+        f"[OK] Exported HW theta curve for {curve_key} @ {asof} to\n"
+        f"      {parquet_path}\n"
+        f"      {xlsx_path}"
+    )
+
+
+def build_hw_theta_from_dense(
+    dense_df: pd.DataFrame,
+    a: float,
+    sigma: float,
+) -> pd.DataFrame:
+    """
+    Given a *single-date* dense zero curve:
+
+        date, tenor_yrs, rate_dec   (rate_dec = zero yield in DECIMAL)
+
+    build:
+
+        - discount factors P(0,t) using continuous compounding: P = exp(-z * t)
+        - instantaneous forward curve f(0,t) = - d/dt ln P(0,t)
+        - Hull–White theta(t) satisfying the initial term structure:
+
+              theta(t) = df/dt + a * f(t) + (sigma^2 / (2a)) * (1 - exp(-2a t))
+
+    Returns a DataFrame with columns:
+
+        date, tenor_yrs, rate_dec, df, inst_fwd, df_dt, theta
+    """
+    if dense_df.empty:
+        raise ValueError("dense_df is empty; cannot build HW theta.")
+
+    df = dense_df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    unique_dates = df["date"].unique()
+    if len(unique_dates) != 1:
+        raise ValueError(
+            f"build_hw_theta_from_dense expects one date, got {unique_dates}"
+        )
+    dt0 = unique_dates[0]
+
+    g = df.sort_values("tenor_yrs")
+    t = g["tenor_yrs"].to_numpy(dtype=float)  # in years
+    z = g["rate_dec"].to_numpy(dtype=float)   # zero yields (decimal)
+
+    if len(t) < 2:
+        raise ValueError("Need at least 2 tenor points to build HW theta.")
+
+    # Discount factors with continuous compounding: P(0,t) = exp(-z * t)
+    lnP = -z * t
+    P = np.exp(lnP)
+
+    # Instantaneous forward: f(0,t) = - d/dt ln P(0,t)
+    dlnP_dt = np.gradient(lnP, t)
+    f_inst = -dlnP_dt
+
+    # df/dt term
+    df_dt = np.gradient(f_inst, t)
+
+    if a <= 0.0:
+        raise ValueError(f"Hull-White mean reversion 'a' must be > 0, got {a}.")
+    if sigma < 0.0:
+        raise ValueError(f"Hull-White sigma must be >= 0, got {sigma}.")
+
+    # Hull–White theta(t)
+    # theta(t) = df/dt + a * f(t) + (sigma^2 / (2a)) * (1 - exp(-2 a t))
+    theta = df_dt + a * f_inst + (sigma * sigma / (2.0 * a)) * (1.0 - np.exp(-2.0 * a * t))
+
+    out = pd.DataFrame(
+        {
+            "date": dt0,
+            "tenor_yrs": t,
+            "rate_dec": z,
+            "df": P,
+            "inst_fwd": f_inst,
+            "df_dt": df_dt,
+            "theta": theta,
+        }
+    )
+    out.sort_values("tenor_yrs", inplace=True)
+    out.reset_index(drop=True, inplace=True)
+    return out
+
 
 def export_dense_curve_and_forward_matrix(
     history_df: pd.DataFrame,
@@ -828,6 +988,303 @@ def export_dense_curve_and_forward_matrix(
         f"[OK] Exported dense zero curves for ALL dates to {dense_dir}, "
         f"and forward matrix for {curve_key} @ {date_str} to {xlsx_path}"
     )
+
+
+def export_forward_matrix_range(
+    history_df: pd.DataFrame,
+    app_cfg: AppConfig,
+    curve_key: str = "AAA_MUNI_SPOT",
+    step_years: float = 0.5,
+) -> None:
+    """
+    Build forward matrices f(t1 -> t2) for a RANGE of dates and
+    export a single long-format Parquet file for Python/ML.
+
+    Controls used (in MUNI_MASTER_BUCKET Controls sheet):
+
+        CURVE_RANGE_FROM   (optional, YYYY-MM-DD)
+        CURVE_RANGE_TO     (optional, YYYY-MM-DD)
+
+    If either is missing, we fall back to the min/max available dates
+    in history_df for the given curve_key.
+
+    Output:
+
+        <repo_root>/output/curves/<CURVE_ASOF_DATE>/forward_range/
+            forward_matrix_<curve_key>_<from>_<to>.parquet
+
+    Parquet columns:
+
+        date, start_yrs, end_yrs, fwd_rate_dec
+    """
+    import pandas as pd
+
+    # Base dated folder like: output/curves/2025-11-26
+    base = app_cfg.dated_output_root
+    outdir = base / "forward_range"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    df = history_df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df = df[df["curve_key"] == curve_key]
+
+    if df.empty:
+        print(f"[WARN] No history rows found for curve_key={curve_key}; skipping forward matrix range export.")
+        return
+
+    # ---- Resolve date range from Controls or disable if not set ----
+    start_raw = None
+    end_raw = None
+    try:
+        if hasattr(app_cfg, "get_control_value"):
+            start_raw = app_cfg.get_control_value("CURVE_RANGE_FROM", default=None)
+            end_raw = app_cfg.get_control_value("CURVE_RANGE_TO", default=None)
+    except Exception:
+        start_raw = None
+        end_raw = None
+
+    # If BOTH are missing/empty -> treat as "feature off"
+    if (not start_raw) and (not end_raw):
+        print(
+            "[INFO] Forward matrix RANGE export disabled: "
+            "no CURVE_RANGE_FROM / CURVE_RANGE_TO set in Controls."
+        )
+        return
+
+    # Otherwise, use provided bounds, falling back to history min/max
+    if start_raw:
+        start_date = pd.to_datetime(start_raw).date()
+    else:
+        start_date = df["date"].min()
+
+    if end_raw:
+        end_date = pd.to_datetime(end_raw).date()
+    else:
+        end_date = df["date"].max()
+
+    # Ensure ordering
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+
+    # Filter dates within range
+    mask_range = (df["date"] >= start_date) & (df["date"] <= end_date)
+    df = df.loc[mask_range]
+
+    if df.empty:
+        print(
+            f"[WARN] No dates in history for curve_key={curve_key} "
+            f"between {start_date} and {end_date}; skipping forward matrix range export."
+        )
+        return
+
+    unique_dates = sorted(df["date"].unique())
+    frames: list[pd.DataFrame] = []
+
+    for dt in unique_dates:
+        try:
+            dense_dt = build_dense_zero_curve_for_date(
+                history_df=history_df,
+                curve_key=curve_key,
+                target_date=dt,
+                step_years=step_years,
+            )
+            fwd_dt = build_forward_matrix_from_dense(dense_dt)
+            frames.append(fwd_dt)
+        except Exception as exc:
+            print(f"[WARN] Skipping date {dt} in forward-matrix range export: {exc}")
+            continue
+
+    if not frames:
+        print(
+            f"[WARN] All dates failed during forward-matrix construction for "
+            f"{curve_key} between {start_date} and {end_date}."
+        )
+        return
+
+    all_fwd = pd.concat(frames, ignore_index=True)
+    all_fwd.sort_values(["date", "start_yrs", "end_yrs"], inplace=True)
+    all_fwd.reset_index(drop=True, inplace=True)
+
+    safe_key = curve_key.replace(" ", "_")
+    fname = f"forward_matrix_{safe_key}_{start_date.isoformat()}_{end_date.isoformat()}.parquet"
+    out_path = outdir / fname
+
+    all_fwd.to_parquet(out_path)
+
+    print(
+        f"[OK] Exported forward matrix RANGE for {curve_key} from {start_date} "
+        f"to {end_date} to {out_path}"
+    )
+
+def export_dense_zero_panel_range(
+    history_df: pd.DataFrame,
+    app_cfg: AppConfig,
+    curve_key_muni: str = "AAA_MUNI_SPOT",
+    curve_key_ust: str = "UST_SPOT",
+    step_years: float = 0.5,
+) -> None:
+    """
+    Build a dense semi-annual zero-curve PANEL for a RANGE of dates,
+    for both AAA_MUNI_SPOT and UST_SPOT, plus their spreads.
+
+    Controls used (in MUNI_MASTER_BUCKET Controls sheet):
+
+        CURVE_RANGE_FROM   (optional, YYYY-MM-DD)
+        CURVE_RANGE_TO     (optional, YYYY-MM-DD)
+
+    If BOTH are blank/missing, we treat this feature as OFF.
+
+    Output:
+
+        <repo_root>/output/curves/<CURVE_ASOF_DATE>/dense_panel/
+            dense_panel_<muni>_<ust>_<from>_<to>.parquet
+
+    Parquet columns:
+
+        date, tenor_yrs, rate_muni_dec, rate_ust_dec, spread_bp
+    """
+    df = history_df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+
+    # Filter only the two curve keys we care about
+    df = df[df["curve_key"].isin([curve_key_muni, curve_key_ust])]
+    if df.empty:
+        print(
+            f"[WARN] No history rows found for curve_key in "
+            f"({curve_key_muni}, {curve_key_ust}); skipping dense panel export."
+        )
+        return
+
+    # ---- Resolve date range from Controls or disable if not set ----
+    start_raw = None
+    end_raw = None
+    try:
+        if hasattr(app_cfg, "get_control_value"):
+            start_raw = app_cfg.get_control_value("CURVE_RANGE_FROM", default=None)
+            end_raw = app_cfg.get_control_value("CURVE_RANGE_TO", default=None)
+    except Exception:
+        start_raw = None
+        end_raw = None
+
+    # If BOTH are missing/empty -> feature OFF
+    if (not start_raw) and (not end_raw):
+        print(
+            "[INFO] Dense zero PANEL range export disabled: "
+            "no CURVE_RANGE_FROM / CURVE_RANGE_TO set in Controls."
+        )
+        return
+
+    # Otherwise, use provided bounds, falling back to history min/max
+    # (using only the muni curve for range if you like, but here we use df)
+    if start_raw:
+        start_date = pd.to_datetime(start_raw).date()
+    else:
+        start_date = df["date"].min()
+
+    if end_raw:
+        end_date = pd.to_datetime(end_raw).date()
+    else:
+        end_date = df["date"].max()
+
+    # Ensure ordering
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+    mask_range = (df["date"] >= start_date) & (df["date"] <= end_date)
+    df = df.loc[mask_range]
+
+    if df.empty:
+        print(
+            f"[WARN] No dates in history for curve panel between "
+            f"{start_date} and {end_date}; skipping dense panel export."
+        )
+        return
+
+    unique_dates = sorted(df["date"].unique())
+
+    muni_frames: list[pd.DataFrame] = []
+    ust_frames: list[pd.DataFrame] = []
+
+    for dt in unique_dates:
+        # muni
+        try:
+            dense_muni = build_dense_zero_curve_for_date(
+                history_df=history_df,
+                curve_key=curve_key_muni,
+                target_date=dt,
+                step_years=step_years,
+            )
+            muni_frames.append(dense_muni)
+        except Exception as exc:
+            print(f"[WARN] Skipping muni dense curve for {dt}: {exc}")
+
+        # ust
+        try:
+            dense_ust = build_dense_zero_curve_for_date(
+                history_df=history_df,
+                curve_key=curve_key_ust,
+                target_date=dt,
+                step_years=step_years,
+            )
+            ust_frames.append(dense_ust)
+        except Exception as exc:
+            print(f"[WARN] Skipping UST dense curve for {dt}: {exc}")
+
+    if not muni_frames or not ust_frames:
+        print(
+            f"[WARN] Dense panel export: no valid muni or ust frames for "
+            f"({curve_key_muni}, {curve_key_ust}) in {start_date}–{end_date}."
+        )
+        return
+
+    muni_all = pd.concat(muni_frames, ignore_index=True)
+    ust_all = pd.concat(ust_frames, ignore_index=True)
+
+    muni_all.rename(columns={"rate_dec": "rate_muni_dec"}, inplace=True)
+    ust_all.rename(columns={"rate_dec": "rate_ust_dec"}, inplace=True)
+
+    # Merge on date + tenor_yrs
+    merged = pd.merge(
+        muni_all[["date", "tenor_yrs", "rate_muni_dec"]],
+        ust_all[["date", "tenor_yrs", "rate_ust_dec"]],
+        on=["date", "tenor_yrs"],
+        how="inner",
+    )
+
+    if merged.empty:
+        print(
+            f"[WARN] No overlapping tenors between muni and UST dense curves "
+            f"in range {start_date}–{end_date}; skipping dense panel export."
+        )
+        return
+
+    merged["spread_bp"] = (merged["rate_muni_dec"] - merged["rate_ust_dec"]) * 10_000.0
+
+    merged.sort_values(["date", "tenor_yrs"], inplace=True)
+    merged.reset_index(drop=True, inplace=True)
+
+    # Output path under dated folder
+    base = app_cfg.dated_output_root
+    outdir = base / "dense_panel"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    muni_safe = curve_key_muni.replace(" ", "_")
+    ust_safe = curve_key_ust.replace(" ", "_")
+
+    fname = (
+        f"dense_panel_{muni_safe}_{ust_safe}_"
+        f"{start_date.isoformat()}_{end_date.isoformat()}.parquet"
+    )
+    out_path = outdir / fname
+
+    merged.to_parquet(out_path)
+
+    print(
+        f"[OK] Exported dense zero PANEL for {curve_key_muni} vs {curve_key_ust} "
+        f"from {start_date} to {end_date} to {out_path}"
+    )
+
 
 # ---------- Dense curves for ALL dates ----------
 

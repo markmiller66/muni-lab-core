@@ -13,7 +13,18 @@ from muni_core.curves.history import (
     get_zero_curve_for_date,
     export_spot_curves_and_spreads,
     export_dense_curve_and_forward_matrix,
+    export_forward_matrix_range,
+    export_dense_zero_panel_range,
+    export_hw_theta_for_asof,   # <--- add this
 )
+
+from muni_core.curves.short_rate_lattice import (
+    export_hw_lattice_for_asof,
+)
+
+
+
+
 
 # -------------------------------------------------------------------
 # Local raw-data loaders (replaces nonexistent muni_core.sources)
@@ -166,6 +177,7 @@ def main() -> None:
     print("\n[TEST] Exporting spot curves + spreads...")
     export_spot_curves_and_spreads(history_df, app_cfg)
 
+
     # --- Export dense semi-annual curve + full forward matrix for AAA_MUNI_SPOT ---
     print("\n[TEST] Exporting dense semi-annual curve + full forward matrix...")
     export_dense_curve_and_forward_matrix(
@@ -174,6 +186,34 @@ def main() -> None:
         curve_key="AAA_MUNI_SPOT",
         step_years=0.5,
     )
+    print("\n[TEST] Exporting forward matrix RANGE (Parquet only)...")
+    export_forward_matrix_range(history_df, app_cfg, curve_key="AAA_MUNI_SPOT", step_years=0.5)
+
+    print("\n[TEST] Exporting dense zero PANEL range (Parquet only)...")
+    export_dense_zero_panel_range(
+        history_df,
+        app_cfg,
+        curve_key_muni="AAA_MUNI_SPOT",
+        curve_key_ust="UST_SPOT",
+        step_years=0.5,
+    )
+    print("\n[TEST] Exporting HW theta curve for as-of date...")
+    export_hw_theta_for_asof(
+        history_df,
+        app_cfg,
+        curve_key="AAA_MUNI_SPOT",
+        step_years=0.5,
+    )
+
+    print("\n[TEST] Exporting HW short-rate lattice for as-of date...")
+    export_hw_lattice_for_asof(
+        history_df,
+        app_cfg,
+        curve_key="AAA_MUNI_SPOT",
+        step_years=0.5,
+    )
+
+
 
     print("\n[OK] Config + raw data loading and curve exports appear to work.")
 
