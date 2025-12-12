@@ -29,10 +29,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 1) Load AppConfig (for curves + column map)
     # ------------------------------------------------------------------
-    # Adjust this name if your YAML is called something else.
     cfg_path = repo_root / "config" / "app_config.yaml"
     if not cfg_path.exists():
-        # Fallback to example_config.yaml if that's what you're using
         fallback = repo_root / "config" / "example_config.yaml"
         if fallback.exists():
             cfg_path = fallback
@@ -56,20 +54,19 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 3) Load bonds from your working Excel file
     # ------------------------------------------------------------------
-    # For now we mirror the path used in run_portfolio_call_scan.py.
-    # You can later route this through AppConfig if desired.
     bonds_file = repo_root / "data" / "working" / "my_300_bonds.xlsx"
     if not bonds_file.exists():
         print(f"[ERROR] Bonds file not found at {bonds_file}")
         sys.exit(1)
 
-    # Use ColumnMap via AppConfig if configured; otherwise BondInputConfig defaults
     try:
         bond_cfg = BondInputConfig.from_app_config(app_cfg)
         print("[DEBUG] BondInputConfig loaded from ColumnMap in MUNI_MASTER_BUCKET.")
     except Exception as e:
-        print(f"[WARN] Could not load BondInputConfig from AppConfig ({e}); "
-              f"falling back to default column names.")
+        print(
+            f"[WARN] Could not load BondInputConfig from AppConfig ({e}); "
+            f"falling back to default column names."
+        )
         bond_cfg = BondInputConfig()
 
     bonds, source_df = load_bonds_from_excel(
@@ -79,6 +76,8 @@ def main() -> None:
     )
 
     print(f"Loaded {len(bonds)} bonds from {bonds_file}")
+    print("First 5 bond clean prices:",
+          [b.clean_price for b in bonds[:5]])
 
     # ------------------------------------------------------------------
     # 4) Solve a constant spread (Z-style) for each bond
@@ -87,11 +86,23 @@ def main() -> None:
 
     for bond in bonds:
         try:
+            # --- Guards on required fields -----------------------------
+            if bond.maturity_date is None:
+                raise ValueError("Bond.maturity_date is None; cannot price.")
+
+            if bond.clean_price is None:
+                raise ValueError(
+                    "Bond.clean_price is None (no market clean price loaded from Excel)."
+                )
+
+            target_price = float(bond.clean_price)
+
             # Solve for spread (Z/OAS backbone) that matches the clean price
             res = solve_oas_for_price(
                 bond,
                 zc,
-                coupon_freq=2,  # semiannual; adjust if you ever add basis-aware freq
+                target_price=target_price,  # explicit target
+                coupon_freq=2,              # semiannual
             )
 
             rows.append(
@@ -103,7 +114,6 @@ def main() -> None:
                     "CleanPrice_Input": bond.clean_price,
                     "HasCall": bond.has_call() if hasattr(bond, "has_call") else None,
 
-                    # Z-style constant spread on top of ZeroCurve
                     "Z_spread_bp": res.oas_bp,
                     "ModelPrice_at_Z": res.model_price,
                     "Z_residual": res.residual,
@@ -117,11 +127,11 @@ def main() -> None:
         except Exception as e:
             rows.append(
                 {
-                    "CUSIP": bond.cusip,
-                    "Rating": bond.rating,
-                    "RatingNum": bond.rating_num,
-                    "Coupon": bond.coupon,
-                    "CleanPrice_Input": bond.clean_price,
+                    "CUSIP": getattr(bond, "cusip", None),
+                    "Rating": getattr(bond, "rating", None),
+                    "RatingNum": getattr(bond, "rating_num", None),
+                    "Coupon": getattr(bond, "coupon", None),
+                    "CleanPrice_Input": getattr(bond, "clean_price", None),
                     "HasCall": bond.has_call() if hasattr(bond, "has_call") else None,
 
                     "Z_spread_bp": None,
@@ -137,7 +147,6 @@ def main() -> None:
     result_df = pd.DataFrame(rows)
     print("\nResult columns:", list(result_df.columns))
 
-    # Quick sanity counts
     print("\nZ_converged value counts:")
     print(result_df["Z_converged"].value_counts(dropna=False))
 

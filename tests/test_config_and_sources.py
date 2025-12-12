@@ -19,9 +19,14 @@ from muni_core.curves.short_rate_lattice import (
     build_state_price_tree_from_lattice,
 )
 from muni_core.pricing import (
+    BondCashflowSchedule,
     build_level_coupon_schedule,
+    price_cashflows_from_state_tree,
+    price_cashflows_from_dense_zero,
     price_level_coupon_bond_hw,
+    price_bullet_bond_hw_from_config,
 )
+
 
 
 # ----------------------------------------------------------------------
@@ -236,16 +241,77 @@ def main() -> None:
         dt_years=1.0,
     )
 
-    # Price via HW + state prices
-    hw_price = price_level_coupon_bond_hw(
+    # Convert list-of-lists state_prices -> DataFrame with t_yrs + state_price
+    levels = state_prices           # list of levels, each a list of state prices
+    n_levels = len(levels) - 1      # 0..N => N time steps
+
+    if n_levels <= 0:
+        raise ValueError("state_prices must contain at least 2 levels.")
+
+    maturity_years = float(schedule.maturity_years)
+    dt_years = maturity_years / float(n_levels)
+
+    records = []
+    for level_idx, row in enumerate(levels):
+        t = level_idx * dt_years
+        for j, sp in enumerate(row):
+            records.append(
+                {
+                    "t_yrs": float(t),
+                    "state_price": float(sp),
+                    "level": int(level_idx),
+                    "state_index": int(j),
+                }
+            )
+
+    state_tree_df = pd.DataFrame.from_records(records)
+
+    # Price via HW state-price tree helper
+    hw_price = price_cashflows_from_state_tree(
+        state_tree_df=state_tree_df,
         schedule=schedule,
-        state_prices=state_prices,
+        time_tolerance=1e-6,
     )
 
     print(
         f"  HW price for toy 10Y 4% bond "
         f"@ {asof_date} ({curve_key}): {hw_price:.6f}"
     )
+
+
+    # --- Date-based HW pricer sanity check (bullet bond) ---
+    from datetime import date as date_type
+
+    # Use same as-of as before (from CURVE_ASOF_DATE or max(history_df.date))
+    hf_local = history_df.copy()
+    hf_local["date"] = pd.to_datetime(hf_local["date"]).dt.date
+    asof_for_dates = hf_local["date"].max()
+
+    # Construct a synthetic 10Y maturity from that as-of date
+    maturity_date = date_type(
+        year=asof_for_dates.year + 10,
+        month=asof_for_dates.month,
+        day=asof_for_dates.day,
+    )
+
+    bullet_price = price_bullet_bond_hw_from_config(
+        history_df=history_df,
+        app_cfg=app_cfg,
+        coupon_rate=0.04,
+        maturity_date=maturity_date,
+        freq_per_year=2,
+        face=100.0,
+        curve_key="AAA_MUNI_SPOT",
+        step_years=0.5,
+        q=0.5,
+        time_tolerance=1e-6,
+    )
+
+    print(
+        f"  HW price via date-based helper (10Y 4% bullet, "
+        f"{asof_for_dates} -> {maturity_date}): {bullet_price:.6f}"
+    )
+
 
     print("\n[OK] Config, raw data loading, curve history, exports, and HW pricer wiring appear to work.\n")
 

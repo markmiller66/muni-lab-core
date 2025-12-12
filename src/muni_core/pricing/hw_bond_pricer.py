@@ -8,6 +8,16 @@ from typing import List, Sequence, Optional
 import numpy as np
 import pandas as pd
 
+from muni_core.config.loader import AppConfig
+from muni_core.curves.history import (
+    build_dense_zero_curve_for_date,
+    build_hw_theta_from_dense,
+)
+from muni_core.curves.short_rate_lattice import (
+    build_binomial_lattice_from_hw,
+    build_state_price_tree_from_lattice,
+)
+from datetime import date as date_type
 
 # -------------------------------------------------------------------
 # Core cashflow representation
@@ -255,41 +265,53 @@ def price_cashflows_from_dense_zero(
 
     return float(price)
 
-
 # -------------------------------------------------------------------
 # Thin wrapper for tests: price via HW state-price tree
 # -------------------------------------------------------------------
 
 
-def price_level_coupon_bond_hw(
+def price_level_coupon_bond_hw_from_state_tree(
     schedule: BondCashflowSchedule,
     state_prices,
     time_tolerance: float = 1e-6,
 ) -> float:
     """
-    Thin wrapper used in tests:
+    Test-friendly wrapper to price a level-coupon bond from a
+    Hull–White state-price tree.
 
-      - 'schedule' is a BondCashflowSchedule
-      - 'state_prices' can be either:
+    Parameters
+    ----------
+    schedule : BondCashflowSchedule
+        Cashflow times and amounts.
+    state_prices :
+        Either:
           * a pandas DataFrame with columns ['t_yrs', 'state_price'], OR
           * a list-of-lists of Arrow–Debreu prices per time step
-            (levels 0..N), where level n has n+1 state prices.
+            (levels[0..N], where level n has n+1 state prices).
 
-    We convert whatever we get into a DataFrame and then delegate to
-    price_cashflows_from_state_tree.
+    time_tolerance : float
+        Passed through to price_cashflows_from_state_tree to warn
+        if cashflow times do not align well with lattice tenors.
+
+    Returns
+    -------
+    float
+        Present value of the bond.
     """
-    # Case 1: already a DataFrame with the right columns
+    # ---- Case 1: already a DataFrame ----
     if isinstance(state_prices, pd.DataFrame):
         df = state_prices
-        # if it already has 't_yrs' and 'state_price', just use it
+
+        # Ideal case: already has the right columns.
         if {"t_yrs", "state_price"}.issubset(df.columns):
             return price_cashflows_from_state_tree(
                 state_tree_df=df,
                 schedule=schedule,
                 time_tolerance=time_tolerance,
             )
-        # Otherwise try to coerce
-        elif "time" in df.columns and "price" in df.columns:
+
+        # Fallback rename case: ['time', 'price'] -> ['t_yrs', 'state_price']
+        if {"time", "price"}.issubset(df.columns):
             df2 = df.rename(columns={"time": "t_yrs", "price": "state_price"})[
                 ["t_yrs", "state_price"]
             ]
@@ -298,16 +320,15 @@ def price_level_coupon_bond_hw(
                 schedule=schedule,
                 time_tolerance=time_tolerance,
             )
-        else:
-            raise ValueError(
-                "state_prices DataFrame must contain either "
-                "['t_yrs', 'state_price'] or ['time', 'price']."
-            )
 
-    # Case 2: list-like input (what tests are currently using)
-    # Expected shape: levels[0..N], each level is a list of state prices
+        raise ValueError(
+            "state_prices DataFrame must contain either "
+            "['t_yrs', 'state_price'] or ['time', 'price'] columns."
+        )
+
+    # ---- Case 2: list-like (what our HW lattice builder returns) ----
     if isinstance(state_prices, (list, tuple)):
-        # If it's a list of dicts, try DataFrame directly
+        # If it's list-of-dicts, try to DataFrame it directly
         if state_prices and isinstance(state_prices[0], dict):
             df = pd.DataFrame(state_prices)
             if {"t_yrs", "state_price"}.issubset(df.columns):
@@ -316,25 +337,23 @@ def price_level_coupon_bond_hw(
                     schedule=schedule,
                     time_tolerance=time_tolerance,
                 )
-            else:
-                raise ValueError(
-                    "List-of-dicts state_prices must have keys 't_yrs' and 'state_price'."
-                )
+            raise ValueError(
+                "List-of-dicts state_prices must have keys 't_yrs' and 'state_price'."
+            )
 
-        # Otherwise we assume list-of-lists: levels of the tree
+        # Otherwise: assume list-of-lists per level
         levels = state_prices
         n_levels = len(levels) - 1  # level 0..N => N time steps
         if n_levels <= 0:
             raise ValueError("state_prices list must contain at least 2 levels.")
 
-        # Use the bond's maturity to infer dt
+        # Use bond maturity to infer the time step dt
         maturity_years = float(schedule.maturity_years)
         dt = maturity_years / float(n_levels)
 
         records = []
         for level_idx, row in enumerate(levels):
             t = level_idx * dt  # time at this level
-            # row is expected to be a sequence of state prices at this level
             for j, sp in enumerate(row):
                 records.append(
                     {
@@ -353,8 +372,196 @@ def price_level_coupon_bond_hw(
             time_tolerance=time_tolerance,
         )
 
-    # Fallback: unsupported type
+    # ---- Fallback: unsupported ----
     raise TypeError(
         f"Unsupported state_prices type: {type(state_prices)}. "
         "Expected DataFrame or list-of-lists."
     )
+
+
+# -------------------------------------------------------------------
+# Thin wrapper for tests: price via HW state-price tree
+# -------------------------------------------------------------------
+
+
+
+
+
+def price_level_coupon_bond_hw(
+    history_df: pd.DataFrame,
+    app_cfg: AppConfig,
+    maturity_years: float,
+    coupon_rate: float,
+    freq_per_year: int = 2,
+    face: float = 100.0,
+    curve_key: str = "AAA_MUNI_SPOT",
+    step_years: float = 0.5,
+    q: float = 0.5,
+    time_tolerance: float = 1e-6,
+) -> float:
+    """
+    High-level Hull–White bond pricer used by PATH 3 and
+    price_bullet_bond_hw_from_config.
+
+    1) Pick as-of date from CURVE_ASOF_DATE or max(history_df.date).
+    2) Build dense zero curve for (asof, curve_key).
+    3) Build HW theta grid from dense curve.
+    4) Build HW binomial short-rate lattice.
+    5) Build state-price tree to match dense zero DFs.
+    6) Build level coupon schedule from 0..maturity_years.
+    7) Price via state prices.
+    """
+    curves_cfg = app_cfg.curves
+
+    # --- as-of date ---
+    if curves_cfg.curve_asof_date:
+        asof = pd.to_datetime(curves_cfg.curve_asof_date).date()
+    else:
+        df_local = history_df.copy()
+        df_local["date"] = pd.to_datetime(df_local["date"]).dt.date
+        asof = df_local["date"].max()
+
+    # --- HW parameters from Controls (or defaults) ---
+    a_raw = None
+    sigma_raw = None
+    if hasattr(app_cfg, "get_control_value"):
+        try:
+            a_raw = app_cfg.get_control_value("HW_A", default=None)
+            sigma_raw = app_cfg.get_control_value("HW_SIGMA_BASE", default=None)
+        except Exception:
+            a_raw = None
+            sigma_raw = None
+
+    a = float(a_raw) if a_raw not in (None, "") else 0.10
+    sigma = float(sigma_raw) if sigma_raw not in (None, "") else 0.01
+
+    # --- dense zero curve for as-of / curve_key ---
+    dense_df = build_dense_zero_curve_for_date(
+        history_df=history_df,
+        curve_key=curve_key,
+        target_date=asof,
+        step_years=step_years,
+    )
+
+    # --- HW theta grid + lattice + state-price tree ---
+    hw_df = build_hw_theta_from_dense(dense_df, a=a, sigma=sigma)
+
+    lattice = build_binomial_lattice_from_hw(
+        hw_df,
+        a=a,
+        sigma=sigma,
+        dt_years=step_years,
+    )
+
+    # NOTE: this returns a list-of-lists of state prices
+    state_prices = build_state_price_tree_from_lattice(lattice)
+
+    # --- build level coupon schedule ---
+    schedule = build_level_coupon_schedule(
+        maturity_years=maturity_years,
+        coupon_rate=coupon_rate,
+        freq_per_year=freq_per_year,
+        dt_years=None,
+        face_value=face,
+    )
+
+    # --- final price via state-price wrapper that handles list-of-lists ---
+    return price_level_coupon_bond_hw_from_state_tree(
+        schedule=schedule,
+        state_prices=state_prices,
+        time_tolerance=time_tolerance,
+    )
+
+
+
+def price_bullet_bond_hw_from_config(
+    history_df: pd.DataFrame,
+    app_cfg: AppConfig,
+    *,
+    coupon_rate: float,
+    maturity_date: date_type,
+    asof_date: Optional[date_type] = None,
+    freq_per_year: int = 2,
+    face: float = 100.0,
+    curve_key: str = "AAA_MUNI_SPOT",
+    step_years: float = 0.5,
+    q: float = 0.5,
+    time_tolerance: float = 1e-6,
+) -> float:
+    """
+    Convenience wrapper: price a *bullet* level-coupon bond using HW,
+    driven by actual calendar dates.
+
+    - Uses CURVE_ASOF_DATE from AppConfig.controls if asof_date is None,
+      otherwise uses the provided asof_date.
+    - Converts (asof -> maturity_date) into maturity_years.
+    - Delegates to price_level_coupon_bond_hw(...) under the hood.
+
+    Parameters
+    ----------
+    history_df : DataFrame
+        Long-form curves table (output of build_historical_curves).
+    app_cfg : AppConfig
+        Global configuration (curves + controls).
+    coupon_rate : float
+        Annual coupon rate (e.g. 0.04 for 4%).
+    maturity_date : date
+        Calendar maturity date of the bond.
+    asof_date : Optional[date]
+        Pricing date. If None, uses CURVE_ASOF_DATE or max(history_df.date).
+    freq_per_year : int
+        Coupon frequency (2 = semiannual).
+    face : float
+        Face value.
+    curve_key : str
+        Which curve to use (default AAA_MUNI_SPOT).
+    step_years : float
+        Lattice time step in years (0.5 = semiannual).
+    q : float
+        Up-move probability parameter in the HW lattice.
+    time_tolerance : float
+        Tolerance for matching cashflow times to lattice tenors
+        (passed through to the underlying pricer).
+
+    Returns
+    -------
+    float
+        HW price of the dated level-coupon bond.
+    """
+    # --- Determine as-of date ---
+    curves_cfg = app_cfg.curves
+
+    if asof_date is not None:
+        asof = asof_date
+    else:
+        if curves_cfg.curve_asof_date:
+            asof = pd.to_datetime(curves_cfg.curve_asof_date).date()
+        else:
+            history_df_local = history_df.copy()
+            history_df_local["date"] = pd.to_datetime(history_df_local["date"]).dt.date
+            asof = history_df_local["date"].max()
+
+    if maturity_date <= asof:
+        raise ValueError(
+            f"maturity_date {maturity_date} must be after as-of date {asof}"
+        )
+
+    # Convert calendar dates to year fraction (simple ACT/365.25 style)
+    delta_days = (maturity_date - asof).days
+    maturity_years = float(delta_days) / 365.25
+
+    # Delegate to the core HW pricer
+    price = price_level_coupon_bond_hw(
+        history_df=history_df,
+        app_cfg=app_cfg,
+        maturity_years=maturity_years,
+        coupon_rate=coupon_rate,
+        freq_per_year=freq_per_year,
+        face=face,
+        curve_key=curve_key,
+        step_years=step_years,
+        q=q,
+        time_tolerance=time_tolerance,
+    )
+
+    return float(price)

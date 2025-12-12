@@ -76,7 +76,7 @@ def price_bond_with_oas(
     bond: Bond,
     curve: ZeroCurve,
     oas_bp: float,
-    *,
+
     coupon_freq: int = 2,
     today: Optional[date] = None,
 ) -> float:
@@ -109,8 +109,26 @@ def price_bond_with_oas(
     oas_dec = oas_bp / 10_000.0
 
     def df_oas(t: float) -> float:
-        # Zero rate from curve + constant OAS
-        r0 = curve.zero_rate(t)
+        """
+        Discount factor with a constant OAS added to the base curve.
+
+        We try curve.zero_rate(t) first. If not available, we fall back
+        to curve.discount_factor(t) and back out the implied zero rate.
+        """
+        if hasattr(curve, "zero_rate"):
+            r0 = curve.zero_rate(t)
+        elif hasattr(curve, "discount_factor"):
+            df0 = curve.discount_factor(t)
+            if t <= 0:
+                r0 = 0.0
+            else:
+                r0 = -math.log(df0) / t
+        else:
+            raise AttributeError(
+                "ZeroCurve must implement either zero_rate(t) or "
+                "discount_factor(t)."
+            )
+
         r = r0 + oas_dec
         return math.exp(-r * t)
 
@@ -131,7 +149,7 @@ def price_bond_with_oas(
 def solve_oas_for_price(
     bond: Bond,
     curve: ZeroCurve,
-    *,
+
     target_price: Optional[float] = None,   # per 100
     coupon_freq: int = 2,
     today: Optional[date] = None,
@@ -151,24 +169,39 @@ def solve_oas_for_price(
     This is for *non-callable* pricing; callable OAS will later plug into
     a HW/Ho-Lee lattice with the same external signature.
     """
+    # --- Normalize target_price robustly ------------------------------
     if target_price is None:
         if bond.clean_price is None:
-            raise ValueError("Either target_price or bond.clean_price must be provided")
+            raise ValueError(
+                "solve_oas_for_price: target_price is None and bond.clean_price is None; "
+                "cannot solve OAS."
+            )
         target_price = float(bond.clean_price)
+    else:
+        target_price = float(target_price)
 
     # Default 'today' to settle_date if available
     if today is None:
         today = bond.settle_date or bond.maturity_date
 
+    if bond.maturity_date is None:
+        raise ValueError("Bond.maturity_date is required for OAS pricing")
+
     # Objective function: model_price(oas) - target_price
     def f(oas_bp: float) -> float:
-        return price_bond_with_oas(
+        price = price_bond_with_oas(
             bond,
             curve,
             oas_bp,
             coupon_freq=coupon_freq,
             today=today,
-        ) - target_price
+        )
+        # Extra guard: we never want a silent None - float
+        if price is None or target_price is None:
+            raise TypeError(
+                f"Internal OAS f(): price={price!r}, target_price={target_price!r}"
+            )
+        return price - target_price
 
     f_low = f(bp_low)
     f_high = f(bp_high)
