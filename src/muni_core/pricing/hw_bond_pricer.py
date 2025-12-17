@@ -21,6 +21,7 @@ from muni_core.curves.short_rate_lattice import (
 from muni_core.model import Bond
 from muni_core.calls import build_bermudan_call_times_3yr_window
 from datetime import date as date_type
+from muni_core.calls.call_schedule import build_bermudan_call_times_3yr_window
 
 
 # -------------------------------------------------------------------
@@ -569,6 +570,125 @@ def price_bullet_bond_hw_from_config(
     )
 
     return float(price)
+
+def price_callable_bond_hw_from_bond(
+    history_df: pd.DataFrame,
+    app_cfg: AppConfig,
+    oas_bp: float,
+    *,
+    bond: Bond,
+    freq_per_year: int = 2,
+    face: float = 100.0,
+    curve_key: str = "AAA_MUNI_SPOT",
+    step_years: float = 0.5,
+    q: float = 0.5,
+    time_tolerance: float = 1e-6,
+) -> float:
+    """
+    High-level Hull–White pricer for a *single Bond* using the
+    Bermudan call schedule helper.
+    """
+    curves_cfg = app_cfg.curves
+
+    # --- as-of date, same logic as other helpers ---
+    if curves_cfg.curve_asof_date:
+        asof = pd.to_datetime(curves_cfg.curve_asof_date).date()
+    else:
+        df_local = history_df.copy()
+        df_local["date"] = pd.to_datetime(df_local["date"]).dt.date
+        asof = df_local["date"].max()
+
+    if bond.maturity_date is None:
+        raise ValueError("Bond.maturity_date is required for HW pricing.")
+
+    if bond.maturity_date <= asof:
+        raise ValueError(
+            f"Bond.maturity_date {bond.maturity_date} must be after as-of date {asof}"
+        )
+
+    # --- dense zero curve for this as-of / curve_key ---
+    dense_df = build_dense_zero_curve_for_date(
+        history_df=history_df,
+        curve_key=curve_key,
+        target_date=asof,
+        step_years=step_years,
+    )
+
+    # --- apply callable OAS as a parallel shift to the zero curve ---
+    oas_dec = oas_bp / 10_000.0
+    if oas_dec != 0.0:
+        dense_df = dense_df.copy()
+        if "rate_dec" not in dense_df.columns:
+            raise ValueError("dense_df must contain 'rate_dec' column for OAS shift.")
+        dense_df["rate_dec"] = dense_df["rate_dec"].astype(float) + oas_dec
+
+    # --- HW parameters from Controls (or defaults), same as price_level_coupon_bond_hw ---
+    a_raw = None
+    sigma_raw = None
+    if hasattr(app_cfg, "get_control_value"):
+        try:
+            a_raw = app_cfg.get_control_value("HW_A", default=None)
+            sigma_raw = app_cfg.get_control_value("HW_SIGMA_BASE", default=None)
+        except Exception:
+            a_raw = None
+            sigma_raw = None
+
+    a = float(a_raw) if a_raw not in (None, "") else 0.10
+    sigma = float(sigma_raw) if sigma_raw not in (None, "") else 0.01
+
+    # --- HW theta grid + lattice ---
+    hw_df = build_hw_theta_from_dense(dense_df, a=a, sigma=sigma)
+
+    lattice = build_binomial_lattice_from_hw(
+        hw_df,
+        a=a,
+        sigma=sigma,
+        dt_years=step_years,
+    )
+
+    # --- maturity in years (simple ACT/365.25 like other helpers) ---
+    delta_days = (bond.maturity_date - asof).days
+    maturity_years = float(delta_days) / 365.25
+
+    # Bond coupon is stored as decimal (e.g. 0.04 for 4%).
+    coupon_rate = float(bond.coupon or 0.0)
+
+    # --- Bermudan call schedule (or none if no call) ---
+    call_times_yrs: list[float]
+    call_price = face
+
+    if getattr(bond, "call_feature", None) is not None:
+        call_dt = bond.call_feature.call_date
+        if call_dt is not None and call_dt > asof:
+            call_times_yrs = build_bermudan_call_times_3yr_window(
+                asof_date=asof,
+                first_call_date=call_dt,
+                maturity_date=bond.maturity_date,
+            )
+            call_price = float(getattr(bond.call_feature, "call_price", face) or face)
+        else:
+            # call date in the past or missing -> treat as non-callable going forward
+            call_times_yrs = []
+    else:
+        call_times_yrs = []
+
+    # --- Delegate to lattice-based callable pricer ---
+    price = price_callable_bond_from_lattice(
+        lattice=lattice,
+        maturity_years=maturity_years,
+        coupon_rate=coupon_rate,
+        freq_per_year=freq_per_year,
+        call_times_yrs=call_times_yrs,
+        face=face,
+        call_price=call_price,
+        q=q,
+        time_tolerance=time_tolerance,
+    )
+
+    return float(price)
+
+
+
 # -------------------------------------------------------------------
 # Callable bond pricing on a HW short-rate lattice
 # -------------------------------------------------------------------
@@ -580,139 +700,135 @@ def price_bullet_bond_hw_from_config(
 
 
 def price_callable_bond_from_lattice(
-    lattice: ShortRateLattice,
+    lattice,
     maturity_years: float,
     coupon_rate: float,
-    freq_per_year: int,
-    call_times_yrs,
-    *,
+    freq_per_year: int = 2,
+    call_times_yrs: Optional[Sequence[float]] = None,
     face: float = 100.0,
     call_price: float = 100.0,
     q: float = 0.5,
     time_tolerance: float = 1e-6,
 ) -> float:
     """
-    Price a *callable* level-coupon bond on a Hull–White short-rate lattice.
+    Price a level-coupon bond on a Hull–White short-rate lattice
+    with an **issuer** Bermudan call (investor is short the option).
 
-    - Uses a recombining binomial short-rate lattice.
-    - Assumes time step dt_years = lattice.dt_years.
-    - Coupons are paid at frequency freq_per_year (e.g. 2 = semiannual).
-    - Calls are allowed ONLY at the supplied Bermudan call times (in years
-      from t=0), mapped to the nearest lattice time step.
+    The lattice is:
+        lattice.dt_years : time step (years)
+        lattice.rates[t][j] : short rate at step t, node j
 
-    Conventions:
-    - Value is investor-view, per 100 notional.
-    - Issuer is assumed to act optimally; at each Bermudan date:
-          V(t) = min( hold_value(t), call_price )
-      so the investor gets the *worse* of holding vs being called.
+    We only use as many steps as needed to reach maturity_years; if the
+    lattice is longer (e.g. 30Y) but the bond is 10Y, we truncate to
+    the first N steps where N * dt ≈ maturity_years.
 
-    NOTE:
-    - The call is modeled as paying only `call_price` at the exercise time
-      (no extra coupon), and the investor forfeits all future flows.
+    Coupons:
+        We assume coupons align with the lattice step size, i.e.
+            dt ≈ 1 / freq_per_year
+        and set coupon_per_period = face * coupon_rate * dt.
+        This matches build_level_coupon_schedule when dt_years is used.
+
+    Early-exercise rule (issuer advantage, investor worst case):
+        At a call date:
+            V_t(j) = min( continuation_value, call_price )
+
+    so the option reduces the investor's value.
     """
+    import math
+
+    if call_times_yrs is None:
+        call_times_yrs = []
+
     dt = float(lattice.dt_years)
-    if dt <= 0.0:
-        raise ValueError(f"ShortRateLattice.dt_years must be positive, got {dt}.")
-
     levels = lattice.rates
-    n_levels_available = len(levels)
-    if n_levels_available == 0:
-        raise ValueError("ShortRateLattice has no levels in callable pricer.")
+    n_steps_total = len(levels)
+    if n_steps_total == 0:
+        raise ValueError("ShortRateLattice has no levels in price_callable_bond_from_lattice.")
 
-    # Number of time steps to reach maturity
-    M_float = maturity_years / dt
-    M = int(round(M_float))
-    if M <= 0:
+    # --- determine how many steps we actually need for maturity ---
+    if dt <= 0.0:
+        raise ValueError(f"Invalid lattice.dt_years={dt}")
+
+    n_steps_use = int(round(maturity_years / dt))
+    if n_steps_use < 1:
         raise ValueError(
-            f"maturity_years={maturity_years} with dt={dt} implies M={M} steps."
+            f"maturity_years={maturity_years} with dt={dt} implies <1 step; "
+            "cannot build callable pricer."
         )
-    if M > n_levels_available:
+    if n_steps_use > n_steps_total:
         raise ValueError(
-            f"Callable HW pricer needs {M} lattice steps to reach maturity, "
-            f"but lattice only has {n_levels_available}. "
-            f"Increase curve horizon or reduce step_years."
+            f"Lattice only has horizon T={n_steps_total * dt:.6f}, "
+            f"but maturity_years={maturity_years:.6f} requires more steps."
         )
 
-    # Coupon per period
-    coupon_per_period = face * float(coupon_rate) / float(freq_per_year)
-
-    # Sanity check: freq vs dt
-    freq_implied = int(round(1.0 / dt))
-    if freq_implied != freq_per_year:
+    T_horizon = n_steps_use * dt
+    if abs(T_horizon - maturity_years) > time_tolerance:
         print(
-            f"[WARN] freq_per_year={freq_per_year} but lattice dt={dt:.6f} "
-            f"implies ~{freq_implied} periods/year. "
-            "Pricing will still proceed, but coupon and lattice times "
-            "may not be perfectly aligned."
+            f"[WARN] Effective horizon T={T_horizon:.6f} from n_steps={n_steps_use} "
+            f"and dt={dt:.6f} differs from maturity_years={maturity_years:.6f}."
         )
 
-    # Map Bermudan call times (years) to lattice step indices k
-    call_step_indices = set()
-    if call_times_yrs:
-        for t_c in call_times_yrs:
-            if t_c <= 0.0:
-                continue
-            k_float = t_c / dt
-            k = int(round(k_float))
-            if k < 0 or k >= M:
-                continue
-            t_k = k * dt
-            if abs(t_k - t_c) > max(time_tolerance, 0.5 * dt):
-                print(
-                    f"[WARN] Bermudan call time t={t_c:.6f} mapped to "
-                    f"start-of-period t={t_k:.6f} (k={k}). "
-                    "Check dt_years vs call schedule alignment."
-                )
-            call_step_indices.add(k)
+    levels_use = levels[:n_steps_use]
 
-    # Backward induction:
-    #   - k indexes the *start* of period [k*dt, (k+1)*dt]
-    #   - At end of final period, pay coupon + face.
-    #   - At call-eligible steps, V_k = min(hold_value, call_price).
+    # Coupons: consistent with dt (dt ≈ 1/freq_per_year)
+    coupon_per_period = face * float(coupon_rate) * dt
 
-    # Terminal step k = M-1
-    V_next = []
-    last_level = levels[M - 1]
-    if len(last_level) != M:
-        raise ValueError(
-            f"Expected {M} nodes at level {M-1}, found {len(last_level)}."
-        )
+    # --- map call times (in years) -> step indices within [0, n_steps_use-1] ---
+    call_steps: set[int] = set()
+    for t_call in call_times_yrs:
+        if t_call <= 0:
+            continue
+        step_f = t_call / dt
+        k = int(round(step_f))
+        # interpret k as "around time t = k * dt"; we place the call
+        # at step index k-1 (just before that time), if in range
+        k_idx = k - 1
+        if 0 <= k_idx < n_steps_use:
+            call_steps.add(k_idx)
 
-    for j in range(M):
-        r_kj = float(last_level[j])
-        disc = float(np.exp(-r_kj * dt))
-        hold_val = disc * (coupon_per_period + face)
-        if (M - 1) in call_step_indices:
-            V_kj = min(hold_val, call_price)
-        else:
-            V_kj = hold_val
-        V_next.append(float(V_kj))
+    # --- terminal payoffs at maturity (last used step) ---
+    last_idx = n_steps_use - 1
+    last_level = levels_use[last_idx]
+    n_nodes_T = len(last_level)
 
-    # Backward for k = M-2, ..., 0
-    for k in range(M - 2, -1, -1):
-        level_rates = levels[k]
-        n_nodes = k + 1
-        if len(level_rates) != n_nodes:
+    # At maturity: final coupon + principal
+    V_next = [face + coupon_per_period] * n_nodes_T
+
+    # --- backward induction over the truncated lattice ---
+    for t in reversed(range(n_steps_use - 1)):  # t = last_idx-1, ..., 0
+        rates_t = levels_use[t]
+        n_nodes_t = len(rates_t)
+
+        if len(V_next) != n_nodes_t + 1:
             raise ValueError(
-                f"Expected {n_nodes} nodes at level {k}, found {len(level_rates)}."
+                f"Dimension mismatch at step {t}: "
+                f"have {len(V_next)} next states, expected {n_nodes_t + 1}."
             )
 
-        V_curr = []
-        for j in range(n_nodes):
-            r_kj = float(level_rates[j])
-            disc = float(np.exp(-r_kj * dt))
+        V_curr = [0.0] * n_nodes_t
 
-            EV_next = (1.0 - q) * V_next[j] + q * V_next[j + 1]
-            hold_val = disc * (coupon_per_period + EV_next)
+        for j in range(n_nodes_t):
+            r_tj = float(rates_t[j])
 
-            if k in call_step_indices:
-                V_kj = min(hold_val, call_price)
-            else:
-                V_kj = hold_val
+            # risk-neutral expectation of next-step values
+            continuation = (1.0 - q) * V_next[j] + q * V_next[j + 1]
 
-            V_curr.append(float(V_kj))
+            # discount back one step
+            disc = math.exp(-r_tj * dt)
+            value_t = continuation * disc
+
+            # add coupon at this step (first coupon at t=dt)
+            value_t += coupon_per_period
+
+            V_curr[j] = value_t
+
+        # issuer call: investor gets the WORSE of continuation or call_price
+        if t in call_steps:
+            V_curr = [min(v, call_price) for v in V_curr]
 
         V_next = V_curr
 
+    # root node at t=0
     return float(V_next[0])
+
 

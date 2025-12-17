@@ -7,6 +7,7 @@ from .npv_call_test import (
     NPVForwardCallResult,
     evaluate_call_npv,
     evaluate_call_with_forwards,
+    build_bermudan_call_times_3yr_window,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "NPVForwardCallResult",
     "evaluate_call_npv",
     "evaluate_call_with_forwards",
+    "build_bermudan_call_times_3yr_window",
 ]

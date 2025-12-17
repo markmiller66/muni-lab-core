@@ -26,6 +26,11 @@ from muni_core.pricing import (
     price_level_coupon_bond_hw,
     price_bullet_bond_hw_from_config,
 )
+from muni_core.pricing.hw_bond_pricer import (
+    price_callable_bond_from_lattice,
+    price_callable_bond_hw_from_bond,
+)
+from muni_core.model import Bond, CallFeature
 
 
 
@@ -278,40 +283,55 @@ def main() -> None:
         f"@ {asof_date} ({curve_key}): {hw_price:.6f}"
     )
 
+    # ------------------------------------------------------------------
+    # 8) Callable HW pricer sanity check (lattice-level)
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 8) Callable HW pricer sanity check (lattice-level)
+    # ------------------------------------------------------------------
+    print("\n[TEST] Callable HW pricer sanity check (lattice-level)...")
 
-    # --- Date-based HW pricer sanity check (bullet bond) ---
-    from datetime import date as date_type
+    # Use the SAME lattice as above, but build both:
+    #   - non-call price (no Bermudan rights)
+    #   - callable price (issuer call at 5y)
+    maturity_years = 10.0
+    coupon_rate = 0.04
+    freq_per_year = 1  # matches dt_years = 1.0 in lattice build
+    call_times_yrs = [5.0]  # single call date at 5y
 
-    # Use same as-of as before (from CURVE_ASOF_DATE or max(history_df.date))
-    hf_local = history_df.copy()
-    hf_local["date"] = pd.to_datetime(hf_local["date"]).dt.date
-    asof_for_dates = hf_local["date"].max()
-
-    # Construct a synthetic 10Y maturity from that as-of date
-    maturity_date = date_type(
-        year=asof_for_dates.year + 10,
-        month=asof_for_dates.month,
-        day=asof_for_dates.day,
-    )
-
-    bullet_price = price_bullet_bond_hw_from_config(
-        history_df=history_df,
-        app_cfg=app_cfg,
-        coupon_rate=0.04,
-        maturity_date=maturity_date,
-        freq_per_year=2,
+    # Non-call price on the same HW lattice (call_times_yrs = [])
+    noncall_hw_price = price_callable_bond_from_lattice(
+        lattice=lattice,
+        maturity_years=maturity_years,
+        coupon_rate=coupon_rate,
+        freq_per_year=freq_per_year,
+        call_times_yrs=[],  # <--- no call feature
         face=100.0,
-        curve_key="AAA_MUNI_SPOT",
-        step_years=0.5,
+        call_price=100.0,
         q=0.5,
         time_tolerance=1e-6,
     )
 
-    print(
-        f"  HW price via date-based helper (10Y 4% bullet, "
-        f"{asof_for_dates} -> {maturity_date}): {bullet_price:.6f}"
+    # Callable price with issuer Bermudan call at 5y
+    callable_hw_price = price_callable_bond_from_lattice(
+        lattice=lattice,
+        maturity_years=maturity_years,
+        coupon_rate=coupon_rate,
+        freq_per_year=freq_per_year,
+        call_times_yrs=call_times_yrs,
+        face=100.0,
+        call_price=100.0,
+        q=0.5,
+        time_tolerance=1e-6,
     )
 
+    print(f"  Non-call HW price (lattice): {noncall_hw_price:.6f}")
+    print(f"  Callable HW price (call @5y): {callable_hw_price:.6f}")
+
+    if callable_hw_price > noncall_hw_price + 1e-6:
+        print("  [WARN] Callable price is not lower than non-call price; investigate.")
+    else:
+        print("  [OK] Callable price is <= non-call price (embedded option cost present).")
 
     print("\n[OK] Config, raw data loading, curve history, exports, and HW pricer wiring appear to work.\n")
 
