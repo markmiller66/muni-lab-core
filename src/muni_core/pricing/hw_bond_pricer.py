@@ -7,6 +7,9 @@ from typing import List, Sequence, Optional
 
 import numpy as np
 import pandas as pd
+import logging
+logger = logging.getLogger(__name__)
+
 
 from muni_core.config.loader import AppConfig
 from muni_core.curves.history import (
@@ -763,9 +766,12 @@ def price_callable_bond_from_lattice(
 
     T_horizon = n_steps_use * dt
     if abs(T_horizon - maturity_years) > time_tolerance:
-        print(
-            f"[WARN] Effective horizon T={T_horizon:.6f} from n_steps={n_steps_use} "
-            f"and dt={dt:.6f} differs from maturity_years={maturity_years:.6f}."
+        logger.debug(
+            "Effective horizon T=%.6f from n_steps=%s and dt=%.6f differs from maturity_years=%.6f.",
+            T_horizon,
+            n_steps_use,
+            dt,
+            maturity_years,
         )
 
     levels_use = levels[:n_steps_use]

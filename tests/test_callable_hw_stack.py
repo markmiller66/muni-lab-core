@@ -42,8 +42,7 @@ NAMING RULES (CRITICAL — ENFORCED BY CONVENTION)
 To prevent module/scalar shadowing bugs:
 
 - Module imports MUST end in `_mod` or `_module`
-    e.g.:
-        import muni_core.risk.callable_parallel_curve_hw as par_curve_mod
+
 
 - Numeric scalars MUST end in `_val` or be obvious attributes
     e.g.:
@@ -60,7 +59,7 @@ To prevent module/scalar shadowing bugs:
 DESIGN GUARANTEES (DO NOT CHANGE)
 --------------------------------
 - Option A = full-curve KRD only
-- Parallel curve bump is diagnostic, NOT KRD
+
 - KRD summarization is a pure post-process
 - sum(KRD) ≈ curve modified duration (within tolerance)
 - No business logic in tests beyond sanity assertions
@@ -80,22 +79,11 @@ LAST KNOWN GOOD STATE
 - sum(KRD) ≈ curve_mod_duration ≈ 8.48
 - Near vs far KRD split validated (≈ 69% / 31%)
 
+EXECUTION
+---------
+- As pytest:   pytest -q tests/test_callable_hw_stack.py
+- As module:   python -m tests.test_callable_hw_stack
 """
-
-"""
-End-to-end callable HW stack test (Option A)
-
-Validates:
-- Callable pricing monotonicity vs OAS
-- Callable OAS solve
-- Callable DV01 / duration
-- Callable KRD (sum vs duration sanity)
-- KRD summary post-process
-
-This file is intentionally self-contained.
-Full path: tests/test_callable_hw_stack.py
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -114,10 +102,14 @@ from muni_core.pricing.hw_bond_pricer_override import (
 
 from muni_core.oas.callable_oas_hw import solve_callable_oas_hw
 from muni_core.oas.callable_dv01_hw import compute_callable_oas_dv01_hw
-from muni_core.risk.callable_krd_hw import compute_callable_krd_hw
+from muni_core.risk.callable_krd_hw_triangular import compute_callable_krd_hw
 
 # KRD summarization is post-process only (no math inside KRD engine)
 from muni_core.risk import summarize_callable_krd, krd_summary_to_frame
+
+
+
+
 
 
 # ---------------------------------------------------------------------
@@ -244,199 +236,269 @@ def _sum_krd(krd_obj) -> float:
 
 
 # ---------------------------------------------------------------------
-# Config + history
+# Main test (pytest-friendly) + executable entrypoint
 # ---------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-CFG_PATH = REPO_ROOT / "config" / "example_config.yaml"
+def test_callable_hw_stack() -> None:
+    # Config + history
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg_path = repo_root / "config" / "example_config.yaml"
 
-cfg = AppConfig.from_yaml(CFG_PATH)
-history_df = pd.read_parquet(cfg.curves.history_file)
+    cfg = AppConfig.from_yaml(cfg_path)
+    history_df = pd.read_parquet(cfg.curves.history_file)
 
-print("History file:", cfg.curves.history_file)
-print("History rows:", len(history_df))
+    print("History file:", cfg.curves.history_file)
+    print("History rows:", len(history_df))
+
+    # Test bond (known-good from earlier runs)
+    bond = Bond(
+        cusip="01025QAX9",
+        rating="A1",
+        rating_num=17,
+        basis="1",
+        settle_date=date(2024, 2, 5),
+        maturity_date=date(2051, 9, 1),
+        coupon=0.04,
+        clean_price=94.1234,
+        quantity=100.0,
+        call_feature=CallFeature(
+            call_date=date(2031, 9, 1),
+            call_price=100.0,
+        ),
+    )
+
+    print("Bond:", bond)
+
+    # Tier 1: Build dense curve + sanity price monotonicity vs OAS (override pricer)
+    asof = _get_asof(cfg, history_df)
+    curve_key = "AAA_MUNI_SPOT"
+    step_years = 0.5
+    q = 0.5
+    freq = 2
+    face = 100.0
+    time_tolerance = 1e-6
+
+    a, sigma = _get_hw_params(cfg)
+
+    dense_raw = build_dense_zero_curve_for_date(
+        history_df=history_df,
+        curve_key=curve_key,
+        target_date=asof,
+        step_years=step_years,
+    )
+    dense_df = _normalize_dense_df(dense_raw)
+
+    # sanity: check the curve bump changes something (debug only)
+    dense_chk1 = dense_df.copy()
+    dense_chk1["zero_rate"] = dense_chk1["zero_rate"] + 0.01  # +100bp
+    if dense_df["zero_rate"].equals(dense_chk1["zero_rate"]):
+        print("[WARN] Dense curve bump sanity check failed (zero_rate unchanged).")
+
+    print(f"\n[Dense] asof={asof} curve_key={curve_key} rows={len(dense_df)}")
+    print(f"[HW] a={a} sigma={sigma} step_years={step_years} q={q}")
+
+    oas_grid = [-2000.0, -1000.0, 0.0, 1000.0, 2000.0]
+
+    prices = []
+    for bp in oas_grid:
+        p = price_callable_bond_hw_from_bond_dense_override(
+            bond=bond,
+            asof=asof,
+            dense_df=dense_df,
+            a=a,
+            sigma=sigma,
+            oas_bp=float(bp),
+            freq_per_year=freq,
+            face=face,
+            step_years=step_years,
+            q=q,
+            time_tolerance=time_tolerance,
+        )
+        prices.append(float(p))
+        print(f"[Monotonicity] OAS {bp:8.1f} bp -> price {p:12.6f}")
+
+    mono_ok = all(prices[i] >= prices[i + 1] for i in range(len(prices) - 1))
+    moved = (max(prices) - min(prices)) > 1e-6
+
+    print("[Monotonicity] non-increasing vs OAS:", mono_ok)
+    print("[Monotonicity] price moved across grid:", moved)
+
+    if not moved:
+        print(
+            "[WARN] Prices did not change across OAS grid — "
+            "override pricer may not be feeding OAS into theta/lattice."
+        )
+    if not mono_ok:
+        print("[WARN] Price is not monotone decreasing in OAS. Investigate curve bumping or call logic.")
+
+    def _bump_parallel_rate_dec(df: pd.DataFrame, bump_bp: float) -> pd.DataFrame:
+        out = df.copy()
+        # bump the curve itself (NOT the oas_bp input)
+        out["zero_rate"] = out["zero_rate"].astype(float) + (bump_bp / 10000.0)
+        return out
+
+    dense_up = _bump_parallel_rate_dec(dense_df, +1.0)
+    dense_dn = _bump_parallel_rate_dec(dense_df, -1.0)
 
 
-# ---------------------------------------------------------------------
-# Test bond (known-good from earlier runs)
-# ---------------------------------------------------------------------
-
-bond = Bond(
-    cusip="01025QAX9",
-    rating="A1",
-    rating_num=17,
-    basis="1",
-    settle_date=date(2024, 2, 5),
-    maturity_date=date(2051, 9, 1),
-    coupon=0.04,
-    clean_price=94.1234,
-    quantity=100.0,
-    call_feature=CallFeature(
-        call_date=date(2031, 9, 1),
-        call_price=100.0,
-    ),
-)
-
-print("Bond:", bond)
-
-
-# ---------------------------------------------------------------------
-# Tier 1: Build dense curve + sanity price monotonicity vs OAS (override pricer)
-# ---------------------------------------------------------------------
-
-asof = _get_asof(cfg, history_df)
-curve_key = "AAA_MUNI_SPOT"
-step_years = 0.5
-q = 0.5
-freq = 2
-face = 100.0
-time_tolerance = 1e-6
-
-a, sigma = _get_hw_params(cfg)
-
-dense_raw = build_dense_zero_curve_for_date(
-    history_df=history_df,
-    curve_key=curve_key,
-    target_date=asof,
-    step_years=step_years,
-)
-dense_df = _normalize_dense_df(dense_raw)
-
-# sanity: check the curve bump changes something (debug only)
-dense_chk1 = dense_df.copy()
-dense_chk1["zero_rate"] = dense_chk1["zero_rate"] + 0.01  # +100bp
-if dense_df["zero_rate"].equals(dense_chk1["zero_rate"]):
-    print("[WARN] Dense curve bump sanity check failed (zero_rate unchanged).")
-
-print(f"\n[Dense] asof={asof} curve_key={curve_key} rows={len(dense_df)}")
-print(f"[HW] a={a} sigma={sigma} step_years={step_years} q={q}")
-
-oas_grid = [-2000.0, -1000.0, 0.0, 1000.0, 2000.0]
-
-prices = []
-for bp in oas_grid:
-    p = price_callable_bond_hw_from_bond_dense_override(
+    p0_det = price_callable_bond_hw_from_bond_dense_override(
         bond=bond,
         asof=asof,
         dense_df=dense_df,
         a=a,
         sigma=sigma,
-        oas_bp=float(bp),
+        oas_bp=0.0,
         freq_per_year=freq,
         face=face,
         step_years=step_years,
         q=q,
         time_tolerance=time_tolerance,
+        allow_call=False,
     )
-    prices.append(float(p))
-    print(f"[Monotonicity] OAS {bp:8.1f} bp -> price {p:12.6f}")
-
-mono_ok = all(prices[i] >= prices[i + 1] for i in range(len(prices) - 1))
-moved = (max(prices) - min(prices)) > 1e-6
-
-print("[Monotonicity] non-increasing vs OAS:", mono_ok)
-print("[Monotonicity] price moved across grid:", moved)
-
-if not moved:
-    print(
-        "[WARN] Prices did not change across OAS grid — "
-        "override pricer may not be feeding OAS into theta/lattice."
+    pup_det = price_callable_bond_hw_from_bond_dense_override(
+        bond=bond,
+        asof=asof,
+        dense_df=dense_up,
+        a=a,
+        sigma=sigma,
+        oas_bp=0.0,
+        freq_per_year=freq,
+        face=face,
+        step_years=step_years,
+        q=q,
+        time_tolerance=time_tolerance,
+        allow_call=False,
     )
-if not mono_ok:
-    print("[WARN] Price is not monotone decreasing in OAS. Investigate curve bumping or call logic.")
+    pdn_det = price_callable_bond_hw_from_bond_dense_override(
+        bond=bond,
+        asof=asof,
+        dense_df=dense_dn,
+        a=a,
+        sigma=sigma,
+        oas_bp=0.0,
+        freq_per_year=freq,
+        face=face,
+        step_years=step_years,
+        q=q,
+        time_tolerance=time_tolerance,
+        allow_call=False,
+    )
+
+    dv01_det = (float(pdn_det) - float(pup_det)) / 2.0
+    mod_dur_det = dv01_det * 10000.0 / float(p0_det)
 
 
-# ---------------------------------------------------------------------
-# Tier 2: Solve callable OAS
-# ---------------------------------------------------------------------
 
-oas_res = solve_callable_oas_hw(
-    bond=bond,
-    history_df=history_df,
-    app_cfg=cfg,
-    target_price=bond.clean_price,
-    coupon_freq=freq,
-    bp_low=-2000.0,
-    bp_high=2000.0,
-    tol=1e-6,
-    max_iter=60,
-    curve_key=curve_key,
-    step_years=step_years,
-    q=q,
-    time_tolerance=time_tolerance,
-)
+    # Tier 2: Solve callable OAS
+    oas_res = solve_callable_oas_hw(
+        bond=bond,
+        history_df=history_df,
+        app_cfg=cfg,
+        target_price=bond.clean_price,
+        coupon_freq=freq,
+        bp_low=-2000.0,
+        bp_high=2000.0,
+        tol=1e-6,
+        max_iter=60,
+        curve_key=curve_key,
+        step_years=step_years,
+        q=q,
+        time_tolerance=time_tolerance,
+    )
 
-print("\n[Callable OAS] ", oas_res)
-assert oas_res is not None
-assert oas_res.converged, "Callable OAS did not converge"
-base_oas = float(oas_res.oas_bp)
+    print("\n[Callable OAS] ", oas_res)
+    assert oas_res is not None
+    assert oas_res.converged, "Callable OAS did not converge"
+    base_oas = float(oas_res.oas_bp)
+
+    # Tier 3: Callable OAS DV01 / duration
+    dv01_res = compute_callable_oas_dv01_hw(
+        bond=bond,
+        history_df=history_df,
+        app_cfg=cfg,
+        base_oas_bp=base_oas,
+        bump_bp=1.0,
+        coupon_freq=freq,
+        curve_key=curve_key,
+        step_years=step_years,
+        q=q,
+        time_tolerance=time_tolerance,
+    )
+
+    print("\n[Callable DV01] ", dv01_res)
+
+    # Basic reasonableness checks
+    assert dv01_res.price_up <= dv01_res.price_base + 1e-9, "Price should fall when OAS increases"
+    assert dv01_res.price_down >= dv01_res.price_base - 1e-9, "Price should rise when OAS decreases"
+    assert dv01_res.dv01_bp >= 0.0, "DV01 should be non-negative for normal bonds"
+    assert dv01_res.mod_duration > 0.0, "ModDuration should be positive"
+
+    # Tier 4: Callable KRD (Option A) + summary (post-process only)
+    krd_res = compute_callable_krd_hw(
+        bond=bond,
+        history_df=history_df,
+        app_cfg=cfg,
+        base_oas_bp=base_oas,
+        curve_key=curve_key,
+        step_years=step_years,
+        q=q,
+    )
+
+    print("\n[Callable KRD] ", krd_res)
+
+    # ---- Pretty KRD/KRC table (by tenor) ----
+    rows = []
+    for t in krd_res.key_tenors:
+        k = float(krd_res.krd.get(t, float("nan")))
+        c = float(krd_res.krc.get(t, float("nan"))) if hasattr(krd_res, "krc") and krd_res.krc else float("nan")
+        pu = float(krd_res.price_up.get(t, float("nan")))
+        pdown = float(krd_res.price_down.get(t, float("nan")))
+
+        rows.append({"tenor_y": float(t), "krd": k, "krc": c, "price_up": pu, "price_down": pdown})
+
+    krd_df = pd.DataFrame(rows).sort_values("tenor_y").reset_index(drop=True)
+    sum_krd_val = float(krd_df["krd"].sum())
+    krd_df["pct_of_sum"] = krd_df["krd"] / sum_krd_val if sum_krd_val and math.isfinite(sum_krd_val) else float("nan")
+
+    print("\n[KRD Nodes] (tenor bumps, Option A)")
+    print(krd_df.to_string(index=False, formatters={
+        "tenor_y": "{:.1f}".format,
+        "krd": "{:.6f}".format,
+        "krc": "{:.6f}".format,
+        "price_up": "{:.6f}".format,
+        "price_down": "{:.6f}".format,
+        "pct_of_sum": "{:.3%}".format,
+    }))
+    print(f"\n[KRD Nodes] sum(krd)={sum_krd_val:.6f}  curve_mod_duration={krd_res.curve_mod_duration:.6f}")
+
+    summary = summarize_callable_krd(krd_res, near_cutoff_years=7.0)
+
+    print("\n[KRD Summary]")
+    print(f"  sum_krd             = {summary.sum_krd:.6f}")
+    print(f"  curve_mod_duration  = {summary.curve_mod_duration:.6f}")
+    print(f"  ratio(sum/curve)    = {summary.ratio_sum_to_curve:.6f}")
+    print(f"  near<=7Y pct        = {summary.near_pct:.3%}")
+    print(f"  far>7Y pct          = {summary.far_pct:.3%}")
+
+    print("\n[KRD Buckets]")
+    for label, pct in summary.bucket_pct.items():
+        print(f"  {label:>6s}: {pct:.3%}  (krd={summary.bucket_krd[label]:.6f})")
+
+    print("\n[KRD Summary Table]")
+    print(krd_summary_to_frame(summary).to_string(index=False))
+
+    # Hard invariant: Option A full-curve KRD sum matches curve duration (within tolerance)
+    assert summary.curve_mod_duration > 0.0
+    assert abs(summary.ratio_sum_to_curve - 1.0) < 1e-3, "Sum(KRD) should match curve duration in Option A"
+
+    # Informational: compare KRD sum to OAS duration (not apples-to-apples, so no strict assert)
+    if dv01_res.mod_duration > 0:
+        ratio_vs_oas = summary.sum_krd / dv01_res.mod_duration
+        print(f"\n[Info] sumKRD / oasModDur ≈ {ratio_vs_oas:.3f}")
+
+    print("\n[OK] Callable HW stack test completed.\n")
 
 
-# ---------------------------------------------------------------------
-# Tier 3: Callable OAS DV01 / duration
-# ---------------------------------------------------------------------
-
-dv01_res = compute_callable_oas_dv01_hw(
-    bond=bond,
-    history_df=history_df,
-    app_cfg=cfg,
-    base_oas_bp=base_oas,
-    bump_bp=1.0,
-    coupon_freq=freq,
-    curve_key=curve_key,
-    step_years=step_years,
-    q=q,
-    time_tolerance=time_tolerance,
-)
-
-print("\n[Callable DV01] ", dv01_res)
-
-# Basic reasonableness checks
-assert dv01_res.price_up <= dv01_res.price_base + 1e-9, "Price should fall when OAS increases"
-assert dv01_res.price_down >= dv01_res.price_base - 1e-9, "Price should rise when OAS decreases"
-assert dv01_res.dv01_bp >= 0.0, "DV01 should be non-negative for normal bonds"
-assert dv01_res.mod_duration > 0.0, "ModDuration should be positive"
-
-
-# ---------------------------------------------------------------------
-# Tier 4: Callable KRD (Option A) + summary (post-process only)
-# ---------------------------------------------------------------------
-
-krd_res = compute_callable_krd_hw(
-    bond=bond,
-    history_df=history_df,
-    app_cfg=cfg,
-    base_oas_bp=base_oas,
-    curve_key=curve_key,
-    step_years=step_years,
-    q=q,
-)
-
-print("\n[Callable KRD] ", krd_res)
-
-summary = summarize_callable_krd(krd_res, near_cutoff_years=7.0)
-
-print("\n[KRD Summary]")
-print(f"  sum_krd             = {summary.sum_krd:.6f}")
-print(f"  curve_mod_duration  = {summary.curve_mod_duration:.6f}")
-print(f"  ratio(sum/curve)    = {summary.ratio_sum_to_curve:.6f}")
-print(f"  near<=7Y pct        = {summary.near_pct:.3%}")
-print(f"  far>7Y pct          = {summary.far_pct:.3%}")
-
-print("\n[KRD Buckets]")
-for label, pct in summary.bucket_pct.items():
-    print(f"  {label:>6s}: {pct:.3%}  (krd={summary.bucket_krd[label]:.6f})")
-
-print("\n[KRD Summary Table]")
-print(krd_summary_to_frame(summary).to_string(index=False))
-
-# Hard invariant: Option A full-curve KRD sum matches curve duration (within tolerance)
-assert summary.curve_mod_duration > 0.0
-assert abs(summary.ratio_sum_to_curve - 1.0) < 1e-3, "Sum(KRD) should match curve duration in Option A"
-
-# Informational: compare KRD sum to OAS duration (not apples-to-apples, so no strict assert)
-if dv01_res.mod_duration > 0:
-    ratio_vs_oas = summary.sum_krd / dv01_res.mod_duration
-    print(f"\n[Info] sumKRD / oasModDur ≈ {ratio_vs_oas:.3f}")
-
-print("\n[OK] Callable HW stack test completed.\n")
+if __name__ == "__main__":
+    # Allows: python -m tests.test_callable_hw_stack
+    test_callable_hw_stack()

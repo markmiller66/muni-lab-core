@@ -1,4 +1,4 @@
-# FILE: src/muni_core/risk/__init__.py
+from __future__ import annotations# FILE: src/muni_core/risk/__init__.py
 """
 Risk analytics for muni_core.
 
@@ -7,31 +7,25 @@ Scope:
 - curve-shape risk: key-rate duration/convexity (KRD/KRC)
 
 Notes:
-- callable_krd_hw.py is the canonical "triangular bump" KRD.
-- callable_parallel_curve_hw.py is a debug/sanity tool (nearest-node bump).
+- callable_krd_hw.py is a backwards-compatible shim.
+- callable_krd_hw_triangular.py is the canonical triangular bump KRD engine.
+"""
+"""
+Risk analytics for muni_core.
 """
 
-from .callable_krd_hw import CallableKRDResult, compute_callable_krd_hw
-from .callable_parallel_curve_hw import compute_callable_parallel_curve_hw, CallableParallelCurveResult
-from .callable_krd_hw import compute_callable_krd_hw, CallableKRDResult
 
+
+from .callable_parallel_curve_hw import CallableParallelCurveResult, compute_callable_parallel_curve_hw
+from .callable_krd_hw_triangular import CallableKRDResult, compute_callable_krd_hw
 from .krd_summary import KRDSummary, summarize_callable_krd, krd_summary_to_frame
 
-
-# If/when you add a parallel curve bump module:
-# from .callable_parallel_curve_hw import CallableParallelResult, compute_callable_parallel_curve_hw
-
-
 __all__ = [
-    "compute_callable_parallel_curve_hw",
     "CallableParallelCurveResult",
-    "compute_callable_krd_hw",
+    "compute_callable_parallel_curve_hw",
     "CallableKRDResult",
-    "summarize_callable_krd",
+    "compute_callable_krd_hw",
     "KRDSummary",
     "summarize_callable_krd",
     "krd_summary_to_frame",
-
-
 ]
-

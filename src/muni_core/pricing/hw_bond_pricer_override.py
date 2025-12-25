@@ -11,19 +11,20 @@ from muni_core.calls.call_schedule import build_bermudan_call_times_3yr_window
 
 
 def price_callable_bond_hw_from_bond_dense_override(
-    *,
     bond: Bond,
     asof: date,
-    dense_df: pd.DataFrame,      # MUST have columns: tenor_yrs, rate_dec (decimal) (or convertible variants)
+    dense_df: pd.DataFrame,
     a: float,
     sigma: float,
     oas_bp: float,
+    allow_call: bool = True,
     freq_per_year: int = 2,
     face: float = 100.0,
     step_years: float = 0.5,
     q: float = 0.5,
     time_tolerance: float = 1e-6,
 ) -> float:
+
     """
     Same callable pricer, but uses caller-provided dense curve (so KRD bumps work).
 
@@ -94,10 +95,11 @@ def price_callable_bond_hw_from_bond_dense_override(
     maturity_years = (bond.maturity_date - asof).days / 365.25
     coupon_rate = float(bond.coupon or 0.0)
 
-    # Bermudan call times
+
+    # Bermudan call times (call exercise can be disabled for deterministic runs)
     call_times_yrs: list[float] = []
     call_price = face
-    if getattr(bond, "call_feature", None) is not None:
+    if allow_call and getattr(bond, "call_feature", None) is not None:
         call_dt = bond.call_feature.call_date
         if call_dt is not None and call_dt > asof:
             call_times_yrs = build_bermudan_call_times_3yr_window(
@@ -118,5 +120,5 @@ def price_callable_bond_hw_from_bond_dense_override(
             call_price=call_price,
             q=q,
             time_tolerance=time_tolerance,
-        )
+                    )
     )
