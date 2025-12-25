@@ -269,7 +269,7 @@ def _bond_from_row(row: pd.Series) -> Bond:
         coupon=float(row["COUPON_DEC"]),
         clean_price=float(row["MARKET_PRICE"]),
         quantity=float(row.get("QTY", 0.0)),
-        call_feature=None,  # TODO: wire your CallFeature builder if needed
+        call_feature=None,
     )
 def _call_window_dv01_points(
     tenor_dv01_map: dict[float, float],
